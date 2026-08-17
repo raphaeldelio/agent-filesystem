@@ -54,7 +54,7 @@ Supporting areas:
 - `.gitignore`: ignores built binaries, local config, copied UI assets, Python artifacts, and editor/test junk.
 - `AGENTS.md`: repo guidance for coding agents.
 - `Dockerfile`: self-hosted container build for the active control-plane path.
-- `LICENSE`: AGPLv3 project license.
+- `LICENSE`: MIT OR BSD-3-Clause project license.
 - `Makefile`: top-level orchestration for mount helpers, command binaries, tests, web-dev, and skill installation.
 - `README.md`: current product story and user-facing usage docs for the workspace-first AFS model.
 - `SKILL.md`: short root-level pointer for agents using this repo.

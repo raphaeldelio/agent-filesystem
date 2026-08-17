@@ -555,3 +555,8 @@ make
 ./afs ws mount demo ~/demo
 cd ~/demo
 ```
+
+## License
+
+Agent Filesystem is dual-licensed under the MIT License or the BSD 3-Clause
+License. See `LICENSE` for details.

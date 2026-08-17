@@ -2,7 +2,7 @@
   "name": "redis-afs",
   "version": "0.1.0",
   "description": "TypeScript SDK for the AFS control plane and agent filesystem mounts.",
-  "license": "AGPL-3.0-only",
+  "license": "MIT OR BSD-3-Clause",
   "homepage": "https://github.com/redis/agent-filesystem/tree/main/sdk/typescript",
   "bugs": {
     "url": "https://github.com/redis/agent-filesystem/issues"
