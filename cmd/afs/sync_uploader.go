@@ -396,7 +396,8 @@ func (u *uploader) processChunkedFile(ctx context.Context, op uploadOp) {
 
 	// Drift check: compare remote chunk manifest against what we stored.
 	_, remoteHashes, err := u.fs.ChunkMeta(ctx, remotePath)
-	if err != nil && !isClientNotFound(err) {
+	remoteMissing := errors.Is(err, redis.Nil) || isClientNotFound(err)
+	if err != nil && !remoteMissing {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("chunk meta %s: %w", op.Path, err)})
 		return
 	}
@@ -411,9 +412,19 @@ func (u *uploader) processChunkedFile(ctx context.Context, op uploadOp) {
 		}
 	}
 
+	// A missing remote file has no unchanged chunks to preserve. Recreate
+	// its complete contents even if this operation was planned as a delta.
+	dirtyChunks := op.DirtyChunks
+	if remoteMissing {
+		dirtyChunks = make([]int, len(op.ChunkHashes))
+		for i := range dirtyChunks {
+			dirtyChunks[i] = i
+		}
+	}
+
 	// Upload dirty chunks in batches.
-	chunks := make(map[int][]byte, len(op.DirtyChunks))
-	for _, idx := range op.DirtyChunks {
+	chunks := make(map[int][]byte, len(dirtyChunks))
+	for _, idx := range dirtyChunks {
 		data, err := readChunkFromDisk(op.AbsPath, idx, op.ChunkSize)
 		if err != nil {
 			u.send(uploadResult{Op: op, Err: fmt.Errorf("read chunk %d of %s: %w", idx, op.Path, err)})

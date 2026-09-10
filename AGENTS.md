@@ -182,6 +182,9 @@ The most important implementation seams are:
 
 ## Lessons Learned
 
+- Chunk metadata lookup can return `redis.Nil` for a missing remote file.
+  Chunked sync uploads must recreate all local chunks when the remote file is
+  absent, including chunks unchanged since the previous sync.
 - Search/BM25 promotion in the Cloud UI should stay restrained and
   operational: prefer compact status text in existing workspace and monitor
   surfaces over extra badge rows or standalone promo cards.
