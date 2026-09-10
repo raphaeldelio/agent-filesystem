@@ -32,6 +32,8 @@ type remoteEvent struct {
 // subscription events, upload results, and download results all funnel
 // through one goroutine so we never have to lock individual entries.
 type reconciler struct {
+	stopCh         <-chan struct{}
+	asyncWG        sync.WaitGroup
 	state          *stateWriter
 	root           string
 	workspace      string
@@ -173,8 +175,6 @@ func (r *reconciler) run(ctx context.Context, local <-chan LocalEvent, remote <-
 	for {
 		select {
 		case <-ctx.Done():
-			close(r.uploadCh)
-			close(r.downloadCh)
 			return
 		case <-symlinkSweep.C:
 			r.sweepMissingLocalSymlinks(ctx)
@@ -202,6 +202,9 @@ func (r *reconciler) run(ctx context.Context, local <-chan LocalEvent, remote <-
 // file from disk, computes the hash, looks up the stored entry, and decides
 // whether to enqueue an upload, drop as echo, or trigger conflict resolution.
 func (r *reconciler) handleLocalEvent(ctx context.Context, ev LocalEvent) {
+	if ctx.Err() != nil {
+		return
+	}
 	if ev.Path == "" {
 		return
 	}
@@ -298,6 +301,11 @@ func (r *reconciler) handleSyncControlRequest(ctx context.Context, rel, requestI
 		return
 	}
 
+	// Save requests are handled by the independent daemon supervisor.
+	// Watcher queue saturation must not prevent their discovery.
+	if request.Operation == syncControlOpSave {
+		return
+	}
 	result = r.executeSyncControlRequest(ctx, request)
 	r.writeSyncControlResult(requestID, result)
 	_ = os.Remove(abs)
@@ -714,18 +722,47 @@ func (r *reconciler) forgetRenameCandidate(entry SyncEntry) {
 }
 
 func (r *reconciler) enqueueUploadOpAsync(op uploadOp, delay time.Duration, shouldSend func() bool) {
+	r.asyncWG.Add(1)
 	go func() {
+		defer r.asyncWG.Done()
 		if delay > 0 {
-			time.Sleep(delay)
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-r.stopCh:
+				return
+			case <-timer.C:
+			}
 		}
 		if shouldSend != nil && !shouldSend() {
 			return
 		}
-		defer func() {
-			_ = recover()
-		}()
-		r.uploadCh <- op
+		r.queueUpload(op)
 	}()
+}
+
+func (r *reconciler) queueUpload(op uploadOp) {
+	select {
+	case <-r.stopCh:
+		return
+	default:
+	}
+	select {
+	case <-r.stopCh:
+	case r.uploadCh <- op:
+	}
+}
+
+func (r *reconciler) queueDownload(op downloadOp) {
+	select {
+	case <-r.stopCh:
+		return
+	default:
+	}
+	select {
+	case <-r.stopCh:
+	case r.downloadCh <- op:
+	}
 }
 
 func (r *reconciler) stageSyncEntry(path string, entry SyncEntry) {
@@ -769,7 +806,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 		hash := compositeHash(hashes)
 		if candidate, ok := r.takeRenameCandidateForLocalFile(rel, localIdentity, hash, actualSize, hasStored); ok {
 			r.installPendingRename(rel, localIdentity, candidate.entry)
-			r.uploadCh <- uploadOp{
+			r.queueUpload(uploadOp{
 				Kind:          opUploadRename,
 				Path:          rel,
 				PrevPath:      candidate.path,
@@ -779,7 +816,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 				LocalIdentity: localIdentity,
 				StoredEntry:   candidate.entry,
 				HasStored:     true,
-			}
+			})
 			if hash != candidate.entry.LocalHash || uint32(info.Mode()&fs.ModePerm) != candidate.entry.Mode {
 				r.stageSyncEntry(rel, SyncEntry{
 					Type:          "file",
@@ -794,7 +831,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 					ChunkHashes:   append([]string(nil), hashes...),
 				})
 				dirty, _ := diffChunkManifests(candidate.entry.ChunkHashes, hashes)
-				r.uploadCh <- uploadOp{
+				r.queueUpload(uploadOp{
 					Kind:          opUploadFile,
 					Path:          rel,
 					AbsPath:       abs,
@@ -808,7 +845,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 					ChunkSize:     r.chunkSize,
 					ChunkHashes:   hashes,
 					DirtyChunks:   dirty,
-				}
+				})
 			}
 			return
 		}
@@ -816,7 +853,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 			return
 		}
 		dirty, _ := diffChunkManifests(stored.ChunkHashes, hashes)
-		r.uploadCh <- uploadOp{
+		r.queueUpload(uploadOp{
 			Kind:          opUploadFile,
 			Path:          rel,
 			AbsPath:       abs,
@@ -830,7 +867,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 			ChunkSize:     r.chunkSize,
 			ChunkHashes:   hashes,
 			DirtyChunks:   dirty,
-		}
+		})
 		return
 	}
 
@@ -843,7 +880,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 	hash := sha256Hex(data)
 	if candidate, ok := r.takeRenameCandidateForLocalFile(rel, localIdentity, hash, fileSize, hasStored); ok {
 		r.installPendingRename(rel, localIdentity, candidate.entry)
-		r.uploadCh <- uploadOp{
+		r.queueUpload(uploadOp{
 			Kind:          opUploadRename,
 			Path:          rel,
 			PrevPath:      candidate.path,
@@ -853,7 +890,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 			LocalIdentity: localIdentity,
 			StoredEntry:   candidate.entry,
 			HasStored:     true,
-		}
+		})
 		if hash != candidate.entry.LocalHash || uint32(info.Mode()&fs.ModePerm) != candidate.entry.Mode {
 			r.stageSyncEntry(rel, SyncEntry{
 				Type:          "file",
@@ -865,7 +902,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 				LocalMtimeMs:  info.ModTime().UnixMilli(),
 				RemoteMtimeMs: candidate.entry.RemoteMtimeMs,
 			})
-			r.uploadCh <- uploadOp{
+			r.queueUpload(uploadOp{
 				Kind:          opUploadFile,
 				Path:          rel,
 				AbsPath:       abs,
@@ -875,14 +912,14 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 				LocalIdentity: localIdentity,
 				StoredEntry:   candidate.entry,
 				HasStored:     true,
-			}
+			})
 		}
 		return
 	}
 	if hasStored && stored.LocalHash == hash && stored.Type == "file" && stored.Mode == uint32(info.Mode()&fs.ModePerm) {
 		return
 	}
-	r.uploadCh <- uploadOp{
+	r.queueUpload(uploadOp{
 		Kind:          opUploadFile,
 		Path:          rel,
 		AbsPath:       abs,
@@ -892,7 +929,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 		LocalIdentity: localIdentity,
 		StoredEntry:   stored,
 		HasStored:     hasStored,
-	}
+	})
 }
 
 func (r *reconciler) handleLocalSymlink(rel, abs string) {
@@ -912,7 +949,7 @@ func (r *reconciler) handleLocalSymlink(rel, abs string) {
 	r.state.mu.Unlock()
 	if candidate, ok := r.takeRenameCandidateForLocalSymlink(rel, localIdentity, target, hasStored); ok {
 		r.installPendingRename(rel, localIdentity, candidate.entry)
-		r.uploadCh <- uploadOp{
+		r.queueUpload(uploadOp{
 			Kind:          opUploadRename,
 			Path:          rel,
 			PrevPath:      candidate.path,
@@ -921,13 +958,13 @@ func (r *reconciler) handleLocalSymlink(rel, abs string) {
 			LocalIdentity: localIdentity,
 			StoredEntry:   candidate.entry,
 			HasStored:     true,
-		}
+		})
 		return
 	}
 	if hasStored && stored.Type == "symlink" && stored.Target == target {
 		return
 	}
-	r.uploadCh <- uploadOp{
+	r.queueUpload(uploadOp{
 		Kind:          opUploadSymlink,
 		Path:          rel,
 		AbsPath:       abs,
@@ -935,7 +972,7 @@ func (r *reconciler) handleLocalSymlink(rel, abs string) {
 		LocalIdentity: localIdentity,
 		StoredEntry:   stored,
 		HasStored:     hasStored,
-	}
+	})
 }
 
 func (r *reconciler) handleLocalDir(ctx context.Context, rel, abs string, info fs.FileInfo) {
@@ -946,14 +983,14 @@ func (r *reconciler) handleLocalDir(ctx context.Context, rel, abs string, info f
 	if hasStored && stored.Type == "dir" {
 		return
 	}
-	r.uploadCh <- uploadOp{
+	r.queueUpload(uploadOp{
 		Kind:        opUploadMkdir,
 		Path:        rel,
 		AbsPath:     abs,
 		Mode:        uint32(info.Mode() & fs.ModePerm),
 		StoredEntry: stored,
 		HasStored:   hasStored,
-	}
+	})
 }
 
 func (r *reconciler) reconcileLocalDirDeletes(ctx context.Context, rel string) {
@@ -1027,7 +1064,7 @@ func (r *reconciler) handleLocalDelete(ctx context.Context, rel, kindHint string
 	}
 	candidateKey := renameCandidateKey(prior)
 	if candidateKey == "" {
-		r.uploadCh <- deleteOp
+		r.queueUpload(deleteOp)
 		return
 	}
 	r.rememberRenameCandidate(rel, prior)
@@ -1126,13 +1163,13 @@ func (r *reconciler) handleRemoteEvent(ctx context.Context, ev remoteEvent) {
 
 				fmt.Fprintf(os.Stderr, "afs sync: handleRemoteEvent %s: stat nil confirmed after retry → tombstone + downloadDelete\n", rel)
 				r.log.RemoteChange(rel, "deleted")
-				r.downloadCh <- downloadOp{
+				r.queueDownload(downloadOp{
 					Kind:        opDownloadDelete,
 					Path:        rel,
 					AbsPath:     abs,
 					StoredEntry: stored,
 					HasStored:   true,
-				}
+				})
 				return
 			}
 		} else {
@@ -1147,21 +1184,21 @@ func (r *reconciler) handleRemoteEvent(ctx context.Context, ev remoteEvent) {
 
 	switch stat.Type {
 	case "dir":
-		r.downloadCh <- downloadOp{
+		r.queueDownload(downloadOp{
 			Kind:        opDownloadMkdir,
 			Path:        rel,
 			AbsPath:     abs,
 			Mode:        stat.Mode,
 			StoredEntry: stored,
 			HasStored:   hasStored,
-		}
+		})
 	case "symlink":
 		target, err := r.fs.Readlink(ctx, absoluteRemotePath(rel))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "afs sync: readlink remote %s: %v\n", rel, err)
 			return
 		}
-		r.downloadCh <- downloadOp{
+		r.queueDownload(downloadOp{
 			Kind:        opDownloadSymlink,
 			Path:        rel,
 			AbsPath:     abs,
@@ -1169,13 +1206,13 @@ func (r *reconciler) handleRemoteEvent(ctx context.Context, ev remoteEvent) {
 			StoredEntry: stored,
 			HasStored:   hasStored,
 			Conflict:    conflict,
-		}
+		})
 	case "file":
 		// Check if the remote file has chunk metadata for delta download.
 		chunkSize, remoteHashes, chunkErr := r.fs.ChunkMeta(ctx, absoluteRemotePath(rel))
 		if chunkErr == nil && chunkSize > 0 && len(remoteHashes) > 0 {
 			dirty, _ := diffChunkManifests(stored.ChunkHashes, remoteHashes)
-			r.downloadCh <- downloadOp{
+			r.queueDownload(downloadOp{
 				Kind:        opDownloadFile,
 				Path:        rel,
 				AbsPath:     abs,
@@ -1188,9 +1225,9 @@ func (r *reconciler) handleRemoteEvent(ctx context.Context, ev remoteEvent) {
 				ChunkSize:   chunkSize,
 				ChunkHashes: remoteHashes,
 				DirtyChunks: dirty,
-			}
+			})
 		} else {
-			r.downloadCh <- downloadOp{
+			r.queueDownload(downloadOp{
 				Kind:        opDownloadFile,
 				Path:        rel,
 				AbsPath:     abs,
@@ -1198,7 +1235,7 @@ func (r *reconciler) handleRemoteEvent(ctx context.Context, ev remoteEvent) {
 				StoredEntry: stored,
 				HasStored:   hasStored,
 				Conflict:    conflict,
-			}
+			})
 		}
 	}
 }
@@ -1241,14 +1278,14 @@ func (r *reconciler) handleUploadResult(ctx context.Context, res uploadResult) {
 		// Remote diverged. The remote-wins resolution is to download the
 		// remote version, push the local copy aside, and create an
 		// auto-checkpoint.
-		r.downloadCh <- downloadOp{
+		r.queueDownload(downloadOp{
 			Kind:        opDownloadFile,
 			Path:        res.Op.Path,
 			AbsPath:     res.Op.AbsPath,
 			StoredEntry: res.Op.StoredEntry,
 			HasStored:   res.Op.HasStored,
 			Conflict:    true,
-		}
+		})
 		go triggerConflictCheckpoint(ctx, r.store, r.workspace)
 		return
 	}

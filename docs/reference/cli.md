@@ -25,6 +25,7 @@ Primary commands:
 | `afs auth` | Log in, log out, and inspect authentication. |
 | `afs setup` | Configure the default local mode. |
 | `afs status` | Show AFS status and mounted workspaces. |
+| `afs vol save` | Save and verify one mounted sync volume in Redis. |
 | `afs ws` | Create, list, mount, unmount, fork, delete, or import workspaces. |
 | `afs fs` | Read, search, and safely write workspace files. |
 | `afs cp` | Create, list, and restore checkpoints. |
@@ -231,6 +232,42 @@ afs status [--verbose]
 
 Shows active mounts in aligned plain columns. Use `--verbose` to include
 control-plane, database, session, mount id, and process details.
+
+### `afs vol save`
+
+```bash
+afs vol save [--timeout 2m] [--json] <volume|directory>
+afs vol save project --timeout 30s --json
+afs vol save /absolute/path/to/mounted-volume
+```
+
+Stop all application writers and other writers to the remote volume before
+calling save. The target is a unique mounted volume name or ID, or the exact
+local mount directory. A child path does not select a subset. Registered
+mounts and the current config's legacy foreground or background sync process
+are supported. Use the matching global `--config` for a legacy process started
+with a custom config. Ambiguous names, stopped daemons, missing local roots,
+readonly mounts and live FUSE or NFS mounts return errors.
+
+Save discovers the included local tree even when watcher notifications were
+missed, then verifies actual file bytes, types, permissions and symlink targets
+in Redis. The mount's ignore rules apply. The daemon resumes normal sync after
+the operation. Save does not create a checkpoint.
+
+| Option | Meaning |
+| --- | --- |
+| `--timeout <duration>` | Positive maximum wait, default `2m`. Accepts durations such as `30s` or `5m`. |
+| `--json` | Emit one JSON result on stdout for success or failure. |
+
+Flags may appear before or after the target. JSON results include `success`,
+`volume`, `local_root`, and an `error` on failure. A successful result includes
+`save.entries`, `save.files`, `save.bytes`, `save.tree_sha256` and
+`save.completed_at`. Errors return a nonzero exit status.
+
+Conflicts, changes during verification, failed transfers, or timeout do not
+confirm save completion. Partial work may already have reached Redis. A timeout
+does not roll back changes. Success establishes Redis visibility, not Redis
+disk durability or an atomic snapshot under concurrent writes.
 
 ## Configuration
 

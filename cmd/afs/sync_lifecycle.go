@@ -232,6 +232,7 @@ func startSyncServices(cfg config, foreground bool) error {
 			return err
 		}
 
+		saveService := startSyncSaveService(ctx, daemon)
 		printSyncReadyBox(runtimeCfg, bootstrap.workspace, localRoot)
 		fmt.Fprintf(os.Stderr, "\n  Running in interactive mode. Ctrl-C to stop.\n\n")
 
@@ -250,7 +251,7 @@ func startSyncServices(cfg config, foreground bool) error {
 		stopStep := startStep("Stopping sync daemon")
 		stopSessionLifecycle()
 		cancel()
-		daemon.Stop()
+		saveService.Stop()
 		stopStep.succeed("clean")
 
 		fmt.Printf("local: preserved at %s\n", localRoot)
@@ -442,9 +443,10 @@ func runSyncDaemon() error {
 		daemon.Stop()
 		return failSyncDaemonReady(readyPath, err)
 	}
+	saveService := startSyncSaveService(ctx, daemon)
 	if err := writeSyncDaemonReady(readyPath, nil); err != nil {
 		stopSessionLifecycle()
-		daemon.Stop()
+		saveService.Stop()
 		return fmt.Errorf("signal sync daemon readiness: %w", err)
 	}
 
@@ -458,7 +460,7 @@ func runSyncDaemon() error {
 	fmt.Fprintf(os.Stderr, "afs sync daemon: shutting down\n")
 	stopSessionLifecycle()
 	cancel()
-	daemon.Stop()
+	saveService.Stop()
 	return nil
 }
 

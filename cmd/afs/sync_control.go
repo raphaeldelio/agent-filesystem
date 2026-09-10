@@ -23,28 +23,35 @@ const (
 	syncControlResultsDirName    = ".afs-sync/results"
 	syncControlOpCreateExclusive = "create-exclusive"
 	syncControlOpUndelete        = "undelete"
+	syncControlOpSave            = "save"
 	defaultSyncControlTimeout    = 10 * time.Second
 )
 
 type syncControlRequest struct {
-	Version   int    `json:"version"`
-	Operation string `json:"operation"`
-	Path      string `json:"path"`
-	Content   string `json:"content"`
-	VersionID string `json:"version_id,omitempty"`
-	FileID    string `json:"file_id,omitempty"`
-	Ordinal   int64  `json:"ordinal,omitempty"`
+	Version           int    `json:"version"`
+	Operation         string `json:"operation"`
+	Path              string `json:"path"`
+	Content           string `json:"content"`
+	VersionID         string `json:"version_id,omitempty"`
+	FileID            string `json:"file_id,omitempty"`
+	Ordinal           int64  `json:"ordinal,omitempty"`
+	DeadlineUnixMilli int64  `json:"deadline_unix_milli,omitempty"`
+	Volume            string `json:"volume,omitempty"`
+	LocalRoot         string `json:"local_root,omitempty"`
 }
 
 type syncControlResult struct {
-	Version   int    `json:"version"`
-	Operation string `json:"operation"`
-	Path      string `json:"path"`
-	Success   bool   `json:"success"`
-	Bytes     int    `json:"bytes,omitempty"`
-	VersionID string `json:"version_id,omitempty"`
-	SourceID  string `json:"source_id,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Version   int              `json:"version"`
+	Operation string           `json:"operation"`
+	Path      string           `json:"path"`
+	Success   bool             `json:"success"`
+	Bytes     int              `json:"bytes,omitempty"`
+	VersionID string           `json:"version_id,omitempty"`
+	SourceID  string           `json:"source_id,omitempty"`
+	Error     string           `json:"error,omitempty"`
+	Volume    string           `json:"volume,omitempty"`
+	LocalRoot string           `json:"local_root,omitempty"`
+	Save      *syncSaveReceipt `json:"save,omitempty"`
 }
 
 func cmdFS(args []string) error {

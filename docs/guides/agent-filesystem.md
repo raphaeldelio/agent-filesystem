@@ -38,6 +38,28 @@ debugging configuration.
 Use sync mode when humans, editors, language servers, tests, or shell tools need
 a normal directory on disk.
 
+Sync mode uploads local changes asynchronously. Before ending a session that
+must preserve its changes, stop all application writes and all other writers
+to the remote volume, then run:
+
+```bash
+afs vol save --timeout 2m --json <volume-or-mount-directory>
+```
+
+Save covers one complete active sync mount, including changes whose watcher
+events were missed. It applies the mount's ignore rules. Success means the
+included tree's actual file bytes, types, permissions and symlink targets were
+verified against Redis. The JSON result includes the volume, local root, entry
+and file counts, byte count, tree SHA256 and completion time. The daemon resumes
+normal synchronization after the operation.
+
+Conflicting local and remote changes, an unstable tree, failed operations, and
+timeout return failure. Some changes may already have reached Redis on failure;
+timeout does not confirm completion or undo work. Save does not create a
+checkpoint, guarantee Redis disk durability, or provide an atomic snapshot
+while writers are active. It requires a writable sync mount and does not apply
+to live FUSE or NFS mounts. Stop writers before retrying a failed save.
+
 Use live mount mode when you specifically need a live filesystem view. On macOS
 AFS uses NFS; on Linux it uses FUSE. Sync mode is usually the friendlier
 default.

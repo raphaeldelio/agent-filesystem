@@ -21,6 +21,8 @@ func cmdVolume(args []string) error {
 		return cmdMountArgs(args[2:])
 	case "unmount":
 		return cmdUnmountArgs(args[2:])
+	case "save":
+		return cmdVolumeSave(args[2:])
 	case "list":
 		return cmdWorkspaceList(args)
 	case "fork":
@@ -64,6 +66,8 @@ Subcommands:
                                                 Import a local directory into a volume
   mount [<volume> [directory]]              Mount a volume to a local folder
   unmount [--delete] [<volume|directory>]   Unmount a volume
+  save [--timeout 2m] [--json] <volume|directory>
+                                                Save and verify a mounted sync volume in Redis
   list                                      List volumes
   fork [source-volume] <new-volume>         Fork a volume from its current checkpoint
   show [volume]                             Show volume metadata

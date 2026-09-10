@@ -167,6 +167,9 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 	}
 	dctx, cancel := context.WithCancel(ctx)
 	d.cancel = cancel
+	d.reconciler.stopCh = dctx.Done()
+	d.uploader.stopCh = dctx.Done()
+	d.downloader.stopCh = dctx.Done()
 
 	if !skipReconcile {
 		if err := d.validateInitialSyncSafety(dctx); err != nil {
@@ -286,6 +289,7 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 
 	go func() {
 		d.wg.Wait()
+		d.reconciler.asyncWG.Wait()
 		if d.watcher != nil {
 			_ = d.watcher.Close()
 		}

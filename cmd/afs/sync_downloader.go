@@ -58,6 +58,7 @@ type downloadResult struct {
 
 // downloader runs in its own goroutine, draining ops from the reconciler.
 type downloader struct {
+	stopCh   <-chan struct{}
 	fs       client.Client
 	results  chan<- downloadResult
 	root     string // local workspace root
@@ -88,7 +89,7 @@ func (d *downloader) run(ctx context.Context, in <-chan downloadOp) {
 		case <-ctx.Done():
 			return
 		case op, ok := <-in:
-			if !ok {
+			if !ok || ctx.Err() != nil {
 				return
 			}
 			d.process(ctx, op)
@@ -341,7 +342,11 @@ func (d *downloader) send(r downloadResult) {
 	if d.results == nil {
 		return
 	}
-	d.results <- r
+	select {
+	case d.results <- r:
+	case <-d.stopCh:
+		// The next generation inspects the actual local tree.
+	}
 }
 
 func randomSuffix() (string, error) {

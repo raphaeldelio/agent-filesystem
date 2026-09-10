@@ -182,6 +182,11 @@ The most important implementation seams are:
 
 ## Lessons Learned
 
+- Sync save completion must join every previous worker generation and delayed
+  sender before scanning or acknowledging a tree. Queue emptiness alone does
+  not establish completion. Verify remote bytes and keep the stored hash format
+  compatible with the chunk metadata used by subsequent background edits.
+
 - Search/BM25 promotion in the Cloud UI should stay restrained and
   operational: prefer compact status text in existing workspace and monitor
   surfaces over extra badge rows or standalone promo cards.

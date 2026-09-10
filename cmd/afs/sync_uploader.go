@@ -61,11 +61,14 @@ type uploadResult struct {
 
 // uploader runs in its own goroutine, draining ops from the reconciler.
 type uploader struct {
-	fs           client.Client
-	results      chan<- uploadResult
-	maxFileBytes int64
-	readonly     bool
-	log          *syncLogger
+	stopCh         <-chan struct{}
+	stoppedResults []uploadResult
+	runContext     context.Context
+	fs             client.Client
+	results        chan<- uploadResult
+	maxFileBytes   int64
+	readonly       bool
+	log            *syncLogger
 
 	// Changelog emission. Zero values disable — see mountChangelog.
 	rdb          *redis.Client
@@ -299,12 +302,13 @@ func versionedSnapshotFromUploadResult(r uploadResult) (controlplane.VersionedFi
 // run drains in until ctx is cancelled. Each op is processed serially so the
 // reconciler can rely on op-completion ordering when applying state updates.
 func (u *uploader) run(ctx context.Context, in <-chan uploadOp) {
+	u.runContext = ctx
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case op, ok := <-in:
-			if !ok {
+			if !ok || ctx.Err() != nil {
 				return
 			}
 			if u.readonly {
@@ -518,11 +522,20 @@ func (u *uploader) send(r uploadResult) {
 	// Emit the changelog entry before forwarding the result so that a
 	// blocked reconciler channel doesn't stall the changelog write. The
 	// helper is no-op when changelog wiring is unmounted.
-	u.emitChange(context.Background(), r)
+	changeCtx := u.runContext
+	if changeCtx == nil {
+		changeCtx = context.Background()
+	}
+	u.emitChange(changeCtx, r)
 	if u.results == nil {
 		return
 	}
-	u.results <- r
+	select {
+	case u.results <- r:
+	case <-u.stopCh:
+		// Preserve the final result for save after every old worker joins.
+		u.stoppedResults = append(u.stoppedResults, r)
+	}
 }
 
 // absoluteRemotePath converts a workspace-relative POSIX path to the
