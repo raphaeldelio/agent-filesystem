@@ -1,9 +1,15 @@
 # Sync watcher overflow recovery
 
-Status: implementation complete, publication awaiting user approval
+Status: initial implementation complete; see subsequent recovery validation below
 Owner: Codex
 Created: 2026-09-10
 Updated: 2026-09-10
+
+This archive records the initial implementation stage. Subsequent uploader and
+reconciliation changes and final validation are recorded in
+[Concurrent overflow recovery](2026-09-10-sync-overflow-races.md). The scope and
+publication status below describe that earlier stage. The user has since
+authorized creating the PR.
 
 ## Goal
 
