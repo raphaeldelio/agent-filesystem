@@ -207,54 +207,24 @@ func runSyncSaveControlRequest(localRoot string, request syncControlRequest) (sy
 			return result, fmt.Errorf("save control path %s must be a directory, not a symlink", rel)
 		}
 	}
-	id, err := randomSuffix()
+	reply, err := exchangeSyncControlRequest(localRoot, request, 0)
 	if err != nil {
 		return result, err
 	}
-	requestPath, resultPath := syncControlRequestPath(localRoot, id), syncControlResultPath(localRoot, id)
-	defer func() { _ = os.Remove(requestPath); _ = os.Remove(resultPath) }()
-	if err := writeSyncControlJSON(requestPath, request, 0o600); err != nil {
-		return result, err
+	if reply.Version != syncControlVersion || reply.Operation != syncControlOpSave ||
+		reply.Volume != request.Volume || reply.LocalRoot != request.LocalRoot {
+		return result, errors.New("save result does not match the requested volume and local root")
 	}
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
-	timeoutErr := errors.New("timed out waiting for save; completion is unconfirmed and partial work may have occurred")
-	for {
-		if !time.Now().Before(deadline) {
-			return result, timeoutErr
+	if !reply.Success {
+		if reply.Error == "" {
+			reply.Error = "save failed; completion was not confirmed"
 		}
-		data, err := os.ReadFile(resultPath)
-		if err == nil {
-			var reply syncControlResult
-			if err := json.Unmarshal(data, &reply); err != nil {
-				return result, fmt.Errorf("parse save result: %w", err)
-			}
-			if reply.Version != syncControlVersion || reply.Operation != syncControlOpSave ||
-				reply.Volume != request.Volume || reply.LocalRoot != request.LocalRoot {
-				return result, errors.New("save result does not match the requested volume and local root")
-			}
-			if !reply.Success {
-				if reply.Error == "" {
-					reply.Error = "save failed; completion was not confirmed"
-				}
-				return reply, errors.New(reply.Error)
-			}
-			if reply.Save == nil {
-				return result, errors.New("save result is missing its verification receipt")
-			}
-			return reply, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return result, err
-		}
-		select {
-		case <-timer.C:
-			return result, timeoutErr
-		case <-ticker.C:
-		}
+		return reply, errors.New(reply.Error)
 	}
+	if reply.Save == nil {
+		return result, errors.New("save result is missing its verification receipt")
+	}
+	return reply, nil
 }
 
 func printSyncSaveResult(result syncControlResult, err error, jsonOut bool) error {

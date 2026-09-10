@@ -27,9 +27,36 @@ func newSyncSaveTestReconciler(t *testing.T, env *syncTestEnv) *reconciler {
 	}
 }
 
+// Direct engine tests supply the same scanned manifest as the save service.
+func scanAndSaveSyncTree(ctx context.Context, r *reconciler) (syncSaveReceipt, error) {
+	local, err := scanSyncSaveLocal(ctx, r)
+	if err != nil {
+		return syncSaveReceipt{}, err
+	}
+	return saveSyncTree(ctx, r, local)
+}
+
+func TestSyncSaveEngineRejectsEditsAfterManifestCapture(t *testing.T) {
+	env := newSyncTestEnv(t)
+	env.writeLocalFile(t, "file", "before")
+	r := newSyncSaveTestReconciler(t, env)
+	local, err := scanSyncSaveLocal(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.writeLocalFile(t, "file", "edited")
+	receipt, err := saveSyncTree(context.Background(), r, local)
+	if err == nil || !strings.Contains(err.Error(), "local tree changed during save") || receipt.TreeSHA256 != "" {
+		t.Fatalf("changed manifest acknowledged: receipt=%+v, err=%v", receipt, err)
+	}
+	if env.remoteExists(t, "file") {
+		t.Fatal("save uploaded a file changed after manifest capture")
+	}
+}
+
 func requireSyncSave(t *testing.T, r *reconciler) syncSaveReceipt {
 	t.Helper()
-	receipt, err := saveSyncTree(context.Background(), r)
+	receipt, err := scanAndSaveSyncTree(context.Background(), r)
 	if err != nil {
 		t.Fatalf("saveSyncTree: %v", err)
 	}
@@ -213,7 +240,7 @@ func TestSyncSaveEngineRejectsConflictsBeforeAnyApply(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := saveSyncTree(context.Background(), r); err == nil || !strings.Contains(err.Error(), "conflict") {
+			if _, err := scanAndSaveSyncTree(context.Background(), r); err == nil || !strings.Contains(err.Error(), "conflict") {
 				t.Fatalf("save error = %v, want conflict", err)
 			}
 			localAfter, _ := scanSyncSaveLocal(context.Background(), r)
@@ -304,7 +331,7 @@ func TestSyncSaveEngineFailsThenRetries(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if receipt, err := saveSyncTree(context.Background(), r); err == nil || receipt.TreeSHA256 != "" {
+			if receipt, err := scanAndSaveSyncTree(context.Background(), r); err == nil || receipt.TreeSHA256 != "" {
 				t.Fatalf("failed operation returned receipt %+v, error %v", receipt, err)
 			}
 			r.fs = env.fsClient
@@ -339,7 +366,7 @@ func TestSyncSaveEnginePreflightRejectsOversizeAndUnsupported(t *testing.T) {
 			case "readonly":
 				r.readonly = true
 			}
-			if _, err := saveSyncTree(context.Background(), r); err == nil {
+			if _, err := scanAndSaveSyncTree(context.Background(), r); err == nil {
 				t.Fatal("save succeeded despite failed preflight")
 			}
 			if env.remoteExists(t, "a-would-upload") {
@@ -379,7 +406,7 @@ func TestSyncSaveEngineCancellationAndLocalChange(t *testing.T) {
 					return env.fsClient.EchoCreate(ctx, "/peer-extra", []byte("peer"), 0o644)
 				}
 			}
-			if receipt, err := saveSyncTree(ctx, r); err == nil || receipt.TreeSHA256 != "" {
+			if receipt, err := scanAndSaveSyncTree(ctx, r); err == nil || receipt.TreeSHA256 != "" {
 				t.Fatalf("unsafe receipt %+v, error %v", receipt, err)
 			}
 			if scenario == "local_change" && env.readLocalFile(t, "file") != "newest" {

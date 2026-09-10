@@ -285,3 +285,41 @@ func TestSyncSaveTimeoutAndControlScope(t *testing.T) {
 		t.Fatalf("wrote outside mount: %v", err)
 	}
 }
+
+func TestSyncSaveExpiredDeadlineDoesNotPublish(t *testing.T) {
+	root := t.TempDir()
+	for _, deadline := range []int64{0, time.Now().Add(-time.Second).UnixMilli()} {
+		result, err := runSyncSaveControlRequest(root, syncControlRequest{Version: syncControlVersion,
+			Operation: syncControlOpSave, Volume: "notes", LocalRoot: root, DeadlineUnixMilli: deadline})
+		if err == nil || err.Error() != "save deadline has expired" || result.Success {
+			t.Fatalf("expired deadline result = %+v, %v", result, err)
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("expired save created control paths: %v", err)
+	}
+}
+
+func TestSyncSaveRejectsControlSubdirectorySymlinks(t *testing.T) {
+	for _, rel := range []string{syncControlRequestsDirName, syncControlResultsDirName} {
+		t.Run(rel, func(t *testing.T) {
+			root, outside := t.TempDir(), t.TempDir()
+			if err := os.Mkdir(filepath.Join(root, syncControlDirName), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(root, rel)); err != nil {
+				t.Fatal(err)
+			}
+			request := syncControlRequest{Version: syncControlVersion, Operation: syncControlOpSave,
+				Volume: "notes", LocalRoot: root, DeadlineUnixMilli: time.Now().Add(time.Second).UnixMilli()}
+			if result, err := runSyncSaveControlRequest(root, request); err == nil || result.Success {
+				t.Fatalf("followed %s symlink: %+v, %v", rel, result, err)
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("save wrote outside mount: %v", err)
+			}
+		})
+	}
+}

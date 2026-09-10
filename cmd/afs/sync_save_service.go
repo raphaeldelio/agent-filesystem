@@ -156,7 +156,7 @@ func (s *syncSaveService) save(request syncControlRequest) syncControlResult {
 		}
 	}
 	if saveErr == nil {
-		receipt, saveErr = saveSyncTree(ctx, daemon.reconciler)
+		receipt, saveErr = saveSyncTree(ctx, daemon.reconciler, afterDrain)
 	}
 	if ctx.Err() != nil {
 		saveErr = ctx.Err()

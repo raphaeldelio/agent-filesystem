@@ -48,20 +48,17 @@ type syncSaveEntry struct {
 
 type syncSaveTree map[string]syncSaveEntry
 
-// saveSyncTree requires the caller to join all steady-state workers first and
-// the application to stop writing. It never changes the local tree. A failure
-// can leave partially applied remote writes and must not be treated as a save.
-func saveSyncTree(ctx context.Context, r *reconciler) (syncSaveReceipt, error) {
+// saveSyncTree uses the local manifest verified by the caller after joining all
+// steady-state workers. The application must stop writing. It never changes the
+// local tree. A failure can leave partially applied remote writes and must not
+// be treated as a save.
+func saveSyncTree(ctx context.Context, r *reconciler, local syncSaveTree) (syncSaveReceipt, error) {
 	var receipt syncSaveReceipt
 	if err := ctx.Err(); err != nil {
 		return receipt, err
 	}
 	if r.readonly {
 		return receipt, fmt.Errorf("cannot save a read-only sync mount")
-	}
-	local, err := scanSyncSaveLocal(ctx, r)
-	if err != nil {
-		return receipt, fmt.Errorf("scan local tree: %w", err)
 	}
 	baseline := r.state.snapshot()
 	remote, err := scanSyncSaveRemote(ctx, r, baseline)
