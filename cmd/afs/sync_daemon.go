@@ -211,7 +211,6 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 	workCtx, workCancel := context.WithCancel(ctx)
 	d.workCancel = workCancel
 	d.uploader.runContext = workCtx
-	d.downloader.runContext = workCtx
 
 	// Steady-state goroutines.
 	stateStop := make(chan struct{})

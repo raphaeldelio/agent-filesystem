@@ -34,6 +34,21 @@ func newFullReconciler(r *reconciler) *fullReconciler {
 	return &fullReconciler{r: r}
 }
 
+// Save keeps the current outbound operation's context alive while stopping
+// generation work. Check both before starting another action or applying an
+// inbound read to the local tree.
+func (f *fullReconciler) checkRunning(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-f.r.stopCh:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
 // observedMeta is what the metadata-only scan collects per path. No file
 // content or hashes — those are deferred to the execution phase where they're
 // actually needed (and can be parallelized).
@@ -81,6 +96,9 @@ func (f *fullReconciler) run(ctx context.Context, onProgress ProgressFunc) error
 // checkpoint restore, where the user explicitly chose to replace active state
 // instead of merging local edits back up.
 func (f *fullReconciler) replaceFromRemote(ctx context.Context, onProgress ProgressFunc) error {
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	if f.r.store == nil || f.r.store.rdb == nil {
 		return fmt.Errorf("root replace requires a store with Redis connection")
 	}
@@ -102,6 +120,9 @@ func (f *fullReconciler) replaceFromRemote(ctx context.Context, onProgress Progr
 	}
 
 	var done int64
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	if _, err := materializeManifestToDirectory(f.r.root, m, func(blobID string) ([]byte, error) {
 		data, ok := blobs[blobID]
 		if !ok {
@@ -247,6 +268,9 @@ func (f *fullReconciler) isColdStart() bool {
 // It reads the full tree in a handful of pipelined HMGet/HGetAll calls —
 // dramatically faster than one LsLong per directory over WAN.
 func (f *fullReconciler) coldStart(ctx context.Context, onProgress ProgressFunc) error {
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	if f.r.store == nil || f.r.store.rdb == nil {
 		return fmt.Errorf("cold start requires a store with Redis connection")
 	}
@@ -271,6 +295,9 @@ func (f *fullReconciler) coldStart(ctx context.Context, onProgress ProgressFunc)
 	}
 
 	var done int64
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	matStats, err := materializeManifestToDirectory(f.r.root, m, func(blobID string) ([]byte, error) {
 		data, ok := blobs[blobID]
 		if !ok {
@@ -340,9 +367,15 @@ func (f *fullReconciler) coldStart(ctx context.Context, onProgress ProgressFunc)
 
 // warmStart diffs local vs remote metadata and syncs only what changed.
 func (f *fullReconciler) warmStart(ctx context.Context, onProgress ProgressFunc) error {
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	local, err := f.scanLocalMeta()
 	if err != nil {
 		return fmt.Errorf("scan local: %w", err)
+	}
+	if err := f.checkRunning(ctx); err != nil {
+		return err
 	}
 	// Detect files that were deleted locally while the daemon was offline.
 	// These didn't produce tombstones (daemon wasn't running), so we stamp
@@ -357,6 +390,9 @@ func (f *fullReconciler) warmStart(ctx context.Context, onProgress ProgressFunc)
 	remote, err := f.scanRemoteMeta(ctx, onProgress)
 	if err != nil {
 		return fmt.Errorf("scan remote: %w", err)
+	}
+	if err := f.checkRunning(ctx); err != nil {
+		return err
 	}
 
 	plan := f.buildPlan(ctx, local, remote)
@@ -698,8 +734,8 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 
 	// Phase 1: directories (serial, fast).
 	for _, a := range dirActions {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if err := f.checkRunning(ctx); err != nil {
+			return err
 		}
 		if err := f.executeAction(ctx, a); err != nil {
 			return err
@@ -710,8 +746,8 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 
 	// Phase 2: ordered deletes (serial, dependency-sensitive).
 	for _, a := range deleteActions {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if err := f.checkRunning(ctx); err != nil {
+			return err
 		}
 		if err := f.executeAction(ctx, a); err != nil {
 			return err
@@ -726,8 +762,9 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 	var firstErr error
 
 	var wg sync.WaitGroup
+dispatch:
 	for _, a := range fileActions {
-		if ctx.Err() != nil {
+		if f.checkRunning(ctx) != nil {
 			break
 		}
 		mu.Lock()
@@ -737,8 +774,14 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 		}
 		mu.Unlock()
 
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case <-f.r.stopCh:
+			break dispatch
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(action syncAction) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -755,11 +798,17 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 	}
 	wg.Wait()
 	f.r.state.markDirty()
+	if firstErr == nil {
+		return f.checkRunning(ctx)
+	}
 	return firstErr
 }
 
 // executeAction applies one planned action directly (no channel dispatch).
 func (f *fullReconciler) executeAction(ctx context.Context, a syncAction) error {
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	switch a.kind {
 	case "mkdir-local":
 		return f.execMkdirLocal(a)
@@ -833,6 +882,9 @@ func (f *fullReconciler) execDownload(ctx context.Context, a syncAction) error {
 		return fmt.Errorf("download %s: %w", a.path, err)
 	}
 	hash := sha256Hex(data)
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 
 	if a.conflict {
 		if _, err := moveLocalToConflict(f.r.conflict, a.absPath); err != nil {
@@ -876,6 +928,9 @@ func (f *fullReconciler) execDownload(ctx context.Context, a syncAction) error {
 }
 
 func (f *fullReconciler) execDeleteLocal(ctx context.Context, a syncAction) error {
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	f.r.log.Info(fmt.Sprintf("execDeleteLocal %s", a.path))
 	info, err := os.Lstat(a.absPath)
 	if err != nil {
@@ -891,6 +946,9 @@ func (f *fullReconciler) execDeleteLocal(ctx context.Context, a syncAction) erro
 		return nil
 	}
 	f.r.echo.markDelete(a.path)
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	if info.IsDir() {
 		_ = os.RemoveAll(a.absPath)
 	} else {
@@ -947,6 +1005,9 @@ func (f *fullReconciler) execUpload(ctx context.Context, a syncAction) error {
 	}
 	hash := sha256Hex(data)
 	remotePath := absoluteRemotePath(a.path)
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	if err := f.r.fs.Echo(ctx, remotePath, data); err != nil {
 		return fmt.Errorf("upload %s: %w", a.path, err)
 	}
@@ -983,6 +1044,9 @@ func (f *fullReconciler) execSymlinkDownload(ctx context.Context, a syncAction) 
 		}
 		target = t
 	}
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(a.absPath), 0o755); err != nil {
 		return err
 	}
@@ -1003,7 +1067,11 @@ func (f *fullReconciler) execSymlinkDownload(ctx context.Context, a syncAction) 
 
 func (f *fullReconciler) execSymlinkUpload(ctx context.Context, a syncAction) error {
 	remotePath := absoluteRemotePath(a.path)
-	if existing, err := f.r.fs.Stat(ctx, remotePath); err == nil && existing != nil {
+	existing, statErr := f.r.fs.Stat(ctx, remotePath)
+	if err := f.checkRunning(ctx); err != nil {
+		return err
+	}
+	if statErr == nil && existing != nil {
 		_ = f.r.fs.Rm(ctx, remotePath)
 	}
 	if err := f.r.fs.Ln(ctx, a.target, remotePath); err != nil {
