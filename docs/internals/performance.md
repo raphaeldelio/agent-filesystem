@@ -1,6 +1,6 @@
 # Performance Notes
 
-Last reviewed: 2026-05-05.
+Last reviewed: 2026-09-10 (sync save profiling).
 
 This file is the durable replacement for old one-off benchmark output
 directories. Keep raw benchmark runs out of the repo; rerun them into `/tmp` or
@@ -69,6 +69,36 @@ The old NFS perf notes produced two changes that are now part of the codebase:
 
 The remaining high-value benchmark target is not another raw output directory;
 it is a repeatable comparison after storage or sync behavior changes.
+
+## Sync Save Profiling
+
+On 2026-09-10, a temporary instrumented build of save implementation `202ac685`
+ran in an ARM64 AWS AgentCore microVM with Redis 8.10.1 on a t4g.large host
+(8 GiB RAM). The workload installed a Python environment, then immediately
+saved 7,081 entries, including 6,444 regular files and 148,888,880 bytes.
+The CLI completed in 266.699 seconds with a ten minute timeout.
+
+| Phase | Wall time, seconds |
+| --- | ---: |
+| Apply pending changes | 169.309 |
+| Read back and verify Redis | 93.827 |
+| Remote preflight | 2.236 |
+| Four local tree scans combined | 0.935 |
+
+Applying changes included 6,280 `EchoCreate` calls totaling 149.598 seconds.
+Final readback included 6,444 `Cat` calls totaling 45.942 seconds and 6,444
+`ChunkMeta` calls totaling 43.547 seconds. These method times are included in
+the phase totals. They measure filesystem client calls, each of which may
+issue multiple Redis commands; they do not isolate network or Redis CPU time.
+The current engine performs these file operations sequentially.
+
+The writer daemon was paused before an independent audit verified all bytes
+and metadata. A fresh reader restored the complete tree and passed all 4,142
+package RECORD hashes and the analytics workload. The instrumentation remained
+outside the production source. This was one profiling run on a larger host
+than the earlier 228.206 second run, so the totals do not establish a speedup.
+Removing the redundant local scan primarily simplifies the save operation;
+local scanning accounts for little of this workload's elapsed time.
 
 ## Rerun Commands
 
