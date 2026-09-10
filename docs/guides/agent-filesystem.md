@@ -45,6 +45,18 @@ and reconciles the existing local tree with Redis. Repeated overflow requests
 coalesce, and a request received during a scan schedules another pass. Failed
 recovery attempts are logged and retried after a one second delay.
 
+Set the event buffer with `afs config set sync.watcherQueueCapacity 8192`.
+The default is 1024 events per sync daemon. Values from 1 through 1048576 are
+accepted; 0 or `afs config unset sync.watcherQueueCapacity` restores the default.
+The setting takes effect when the sync daemon next starts. It does not change
+the operating system's watcher limits.
+
+A larger event buffer consumes more memory and can absorb longer bursts, but
+does not increase synchronization throughput. The recovery channel holds one
+pending scan signal regardless of event buffer capacity. Recovery scans the
+workspace and performs Redis operations, adding CPU, disk, and network work.
+Continued overflow can require further scans and delay synchronization.
+
 Recovery follows the existing reconciliation and conflict rules. A successful
 local write does not wait for remote upload, so changes can still be lost if the
 local environment disappears before synchronization completes.

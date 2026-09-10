@@ -12,7 +12,7 @@ import (
 
 func TestWatcherDirectoryWatchFailureRequestsRecovery(t *testing.T) {
 	root := t.TempDir()
-	w, err := newSyncWatcher(root, nil, time.Hour)
+	w, err := newSyncWatcher(root, nil, time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestWatcherStaleDirectoryEventRequestsRecovery(t *testing.T) {
 			if err := os.MkdirAll(nested, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			w, err := newSyncWatcher(root, nil, 10*time.Millisecond)
+			w, err := newSyncWatcher(root, nil, 10*time.Millisecond, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

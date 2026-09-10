@@ -266,6 +266,7 @@ Common keys:
 | `redis.url` | Standalone Redis URL. |
 | `agent.name` | Human-friendly agent name for attribution. |
 | `sync.fileSizeCapMB` | Maximum file size synced by the mount daemon. |
+| `sync.watcherQueueCapacity` | Buffered local watcher events per sync daemon. Default: 1024. Accepts integers from 1 through 1048576; 0 resets to the default. Applies when the daemon next starts. |
 
 Examples:
 
@@ -277,6 +278,7 @@ afs config set mode mount
 afs config set controlPlane.url http://127.0.0.1:8091
 afs config set agent.name "Claude Code"
 afs config set sync.fileSizeCapMB 4096
+afs config set sync.watcherQueueCapacity 8192
 afs config unset controlPlane.database
 afs config reset
 afs config list

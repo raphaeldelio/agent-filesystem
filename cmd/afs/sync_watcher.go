@@ -56,7 +56,13 @@ type pendingEvent struct {
 // returning, so the caller can immediately walk the tree without missing
 // in-flight events. The returned channel emits one LocalEvent per coalesced
 // event after the debounce window expires.
-func newSyncWatcher(root string, ignore *syncIgnore, debounce time.Duration) (*syncWatcher, error) {
+func newSyncWatcher(root string, ignore *syncIgnore, debounce time.Duration, queueCapacity int) (*syncWatcher, error) {
+	if err := validateSyncWatcherQueueCapacity(queueCapacity); err != nil {
+		return nil, err
+	}
+	if queueCapacity == 0 {
+		queueCapacity = defaultSyncWatcherQueueCapacity
+	}
 	if debounce <= 0 {
 		debounce = 100 * time.Millisecond
 	}
@@ -71,7 +77,7 @@ func newSyncWatcher(root string, ignore *syncIgnore, debounce time.Duration) (*s
 		w:        w,
 		pending:  make(map[string]*pendingEvent),
 		dirs:     make(map[string]struct{}),
-		out:      make(chan LocalEvent, 1024),
+		out:      make(chan LocalEvent, queueCapacity),
 		rescan:   make(chan struct{}, 1),
 	}
 	if err := sw.addRecursive(sw.root); err != nil {

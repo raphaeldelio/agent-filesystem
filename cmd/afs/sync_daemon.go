@@ -20,14 +20,15 @@ import (
 // grouped by concern: the workspace and root path, the Redis client, and
 // optional knobs (size cap, debounce, readonly).
 type syncDaemonConfig struct {
-	Workspace       string
-	LocalRoot       string // absolute, will be created if missing
-	FS              client.Client
-	Store           *afsStore
-	MaxFileBytes    int64
-	WatcherDebounce time.Duration
-	Readonly        bool
-	Interactive     bool // when true, log every file event to stderr
+	Workspace            string
+	LocalRoot            string // absolute, will be created if missing
+	FS                   client.Client
+	Store                *afsStore
+	MaxFileBytes         int64
+	WatcherDebounce      time.Duration
+	WatcherQueueCapacity int
+	Readonly             bool
+	Interactive          bool // when true, log every file event to stderr
 	// ApprovedInitialMountMerge is set by the mount preflight after it has
 	// shown the local/remote plan and confirmed the safe union with the user.
 	ApprovedInitialMountMerge bool
@@ -74,6 +75,9 @@ type syncDaemon struct {
 // newSyncDaemon initializes (but does not start) a daemon for the given
 // workspace + local path. Run() does the heavy lifting.
 func newSyncDaemon(cfg syncDaemonConfig) (*syncDaemon, error) {
+	if err := validateSyncWatcherQueueCapacity(cfg.WatcherQueueCapacity); err != nil {
+		return nil, err
+	}
 	if cfg.FS == nil {
 		return nil, errors.New("syncDaemon: nil client")
 	}
@@ -196,7 +200,7 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 	// the target directory — that would invalidate any fsnotify watches
 	// installed earlier. Installing after guarantees the watches land on
 	// the final directory tree.
-	w, err := newSyncWatcher(d.cfg.LocalRoot, d.ignore, d.cfg.WatcherDebounce)
+	w, err := newSyncWatcher(d.cfg.LocalRoot, d.ignore, d.cfg.WatcherDebounce, d.cfg.WatcherQueueCapacity)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("watcher: %w", err)

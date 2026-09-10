@@ -31,7 +31,8 @@ type logSettings struct {
 }
 
 type syncSettings struct {
-	SyncFileSizeCapMB int `json:"fileSizeCapMB"`
+	SyncFileSizeCapMB        int `json:"fileSizeCapMB"`
+	SyncWatcherQueueCapacity int `json:"watcherQueueCapacity,omitempty"`
 }
 
 type controlPlaneSettings struct {

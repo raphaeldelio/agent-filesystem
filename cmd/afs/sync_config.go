@@ -16,6 +16,25 @@ const (
 // chunked delta sync avoids loading entire files into memory.
 const defaultSyncFileSizeCapMB = 2048
 
+const (
+	defaultSyncWatcherQueueCapacity = 1024
+	maxSyncWatcherQueueCapacity     = 1 << 20
+)
+
+func validateSyncWatcherQueueCapacity(capacity int) error {
+	if capacity < 0 || capacity > maxSyncWatcherQueueCapacity {
+		return fmt.Errorf("sync.watcherQueueCapacity must be between 0 and %d (0 uses the default %d)", maxSyncWatcherQueueCapacity, defaultSyncWatcherQueueCapacity)
+	}
+	return nil
+}
+
+func syncWatcherQueueCapacity(cfg config) int {
+	if cfg.SyncWatcherQueueCapacity == 0 {
+		return defaultSyncWatcherQueueCapacity
+	}
+	return cfg.SyncWatcherQueueCapacity
+}
+
 // effectiveMode returns the resolved Mode for the daemon. Empty resolves to
 // sync. Any unrecognized value is reported as an error so the user notices a
 // typo immediately rather than after a confusing fallback.
