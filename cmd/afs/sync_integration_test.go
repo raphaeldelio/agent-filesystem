@@ -1029,16 +1029,17 @@ func TestSyncHistoryRenamePreservesLineage(t *testing.T) {
 			oldHistory.Lineages[0].Versions[1].Path == "/renamed.txt"
 	})
 
-	newHistory, err := service.GetFileHistory(ctx, env.workspace, "/renamed.txt", false)
-	if err != nil {
-		t.Fatalf("GetFileHistory(/renamed.txt) returned error: %v", err)
-	}
-	if len(newHistory.Lineages) != 1 {
-		t.Fatalf("len(newHistory.Lineages) = %d, want 1", len(newHistory.Lineages))
-	}
-	if got := newHistory.Lineages[0].Versions[len(newHistory.Lineages[0].Versions)-1].Op; got != controlplane.ChangeOpPut {
-		t.Fatalf("latest renamed.txt op = %q, want %q", got, controlplane.ChangeOpPut)
-	}
+	// File bytes become visible before the uploader appends their history row.
+	var newHistory controlplane.FileHistoryResponse
+	assertEventually(t, 3*time.Second, "renamed.txt content update history", func() bool {
+		var getErr error
+		newHistory, getErr = service.GetFileHistory(ctx, env.workspace, "/renamed.txt", false)
+		if getErr != nil || len(newHistory.Lineages) != 1 || len(newHistory.Lineages[0].Versions) == 0 {
+			return false
+		}
+		versions := newHistory.Lineages[0].Versions
+		return versions[len(versions)-1].Op == controlplane.ChangeOpPut
+	})
 	if newHistory.Lineages[0].FileID != oldHistory.Lineages[0].FileID {
 		t.Fatalf("renamed file_id = %q, want %q", newHistory.Lineages[0].FileID, oldHistory.Lineages[0].FileID)
 	}

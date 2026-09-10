@@ -302,7 +302,9 @@ func versionedSnapshotFromUploadResult(r uploadResult) (controlplane.VersionedFi
 // run drains in until ctx is cancelled. Each op is processed serially so the
 // reconciler can rely on op-completion ordering when applying state updates.
 func (u *uploader) run(ctx context.Context, in <-chan uploadOp) {
-	u.runContext = ctx
+	if u.runContext == nil {
+		u.runContext = ctx
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -315,7 +317,7 @@ func (u *uploader) run(ctx context.Context, in <-chan uploadOp) {
 				u.send(uploadResult{Op: op, Err: errors.New("uploader is read-only")})
 				continue
 			}
-			u.process(ctx, op)
+			u.process(u.runContext, op)
 		}
 	}
 }

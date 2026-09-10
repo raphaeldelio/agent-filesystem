@@ -137,7 +137,7 @@ func (s *syncSaveService) save(request syncControlRequest) syncControlResult {
 	// Cancelling the old generation stops producers as well as workers. Join
 	// delayed delete senders and in-flight writes before inspecting the tree.
 	// If a client has already timed out, no later success or new save is started.
-	daemon.Stop()
+	daemon.StopForSave(ctx)
 	s.active = nil
 	s.applyStoppedUploadResults(daemon)
 	receipt, saveErr := saveSyncTree(ctx, daemon.reconciler)

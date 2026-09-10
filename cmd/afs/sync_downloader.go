@@ -58,15 +58,16 @@ type downloadResult struct {
 
 // downloader runs in its own goroutine, draining ops from the reconciler.
 type downloader struct {
-	stopCh   <-chan struct{}
-	fs       client.Client
-	results  chan<- downloadResult
-	root     string // local workspace root
-	pid      int
-	conflict *conflictNamer
-	echo     *echoSuppressor
-	readonly bool
-	log      *syncLogger
+	stopCh     <-chan struct{}
+	runContext context.Context
+	fs         client.Client
+	results    chan<- downloadResult
+	root       string // local workspace root
+	pid        int
+	conflict   *conflictNamer
+	echo       *echoSuppressor
+	readonly   bool
+	log        *syncLogger
 }
 
 func newDownloader(fs client.Client, results chan<- downloadResult, root string, conflict *conflictNamer, echo *echoSuppressor, readonly bool, log *syncLogger) *downloader {
@@ -84,6 +85,9 @@ func newDownloader(fs client.Client, results chan<- downloadResult, root string,
 
 // run drains in until ctx is cancelled.
 func (d *downloader) run(ctx context.Context, in <-chan downloadOp) {
+	if d.runContext == nil {
+		d.runContext = ctx
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -92,7 +96,7 @@ func (d *downloader) run(ctx context.Context, in <-chan downloadOp) {
 			if !ok || ctx.Err() != nil {
 				return
 			}
-			d.process(ctx, op)
+			d.process(d.runContext, op)
 		}
 	}
 }
