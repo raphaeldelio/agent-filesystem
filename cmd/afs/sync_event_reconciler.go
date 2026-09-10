@@ -771,6 +771,21 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 		hash := compositeHash(hashes)
 		if candidate, ok := r.takeRenameCandidateForLocalFile(rel, localIdentity, hash, actualSize, hasStored); ok {
 			renameVersion := r.installPendingRename(rel, localIdentity, candidate.entry)
+			changed := hash != candidate.entry.LocalHash || uint32(info.Mode()&fs.ModePerm) != candidate.entry.Mode
+			if changed {
+				renameVersion = r.stageSyncEntry(rel, SyncEntry{
+					Type:          "file",
+					Mode:          uint32(info.Mode() & fs.ModePerm),
+					Size:          actualSize,
+					LocalHash:     hash,
+					LocalIdentity: localIdentity,
+					RemoteHash:    candidate.entry.RemoteHash,
+					LocalMtimeMs:  info.ModTime().UnixMilli(),
+					RemoteMtimeMs: candidate.entry.RemoteMtimeMs,
+					ChunkSize:     r.chunkSize,
+					ChunkHashes:   append([]string(nil), hashes...),
+				})
+			}
 			r.enqueueTrackedUpload(uploadOp{
 				Kind:          opUploadRename,
 				Path:          rel,
@@ -784,19 +799,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 				StoredEntry:   candidate.entry,
 				HasStored:     true,
 			})
-			if hash != candidate.entry.LocalHash || uint32(info.Mode()&fs.ModePerm) != candidate.entry.Mode {
-				r.stageSyncEntry(rel, SyncEntry{
-					Type:          "file",
-					Mode:          uint32(info.Mode() & fs.ModePerm),
-					Size:          actualSize,
-					LocalHash:     hash,
-					LocalIdentity: localIdentity,
-					RemoteHash:    candidate.entry.RemoteHash,
-					LocalMtimeMs:  info.ModTime().UnixMilli(),
-					RemoteMtimeMs: candidate.entry.RemoteMtimeMs,
-					ChunkSize:     r.chunkSize,
-					ChunkHashes:   append([]string(nil), hashes...),
-				})
+			if changed {
 				dirty, _ := diffChunkManifests(candidate.entry.ChunkHashes, hashes)
 				r.enqueueTrackedUpload(uploadOp{
 					Kind:          opUploadFile,
@@ -849,6 +852,19 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 	hash := sha256Hex(data)
 	if candidate, ok := r.takeRenameCandidateForLocalFile(rel, localIdentity, hash, fileSize, hasStored); ok {
 		renameVersion := r.installPendingRename(rel, localIdentity, candidate.entry)
+		changed := hash != candidate.entry.LocalHash || uint32(info.Mode()&fs.ModePerm) != candidate.entry.Mode
+		if changed {
+			renameVersion = r.stageSyncEntry(rel, SyncEntry{
+				Type:          "file",
+				Mode:          uint32(info.Mode() & fs.ModePerm),
+				Size:          fileSize,
+				LocalHash:     hash,
+				LocalIdentity: localIdentity,
+				RemoteHash:    candidate.entry.RemoteHash,
+				LocalMtimeMs:  info.ModTime().UnixMilli(),
+				RemoteMtimeMs: candidate.entry.RemoteMtimeMs,
+			})
+		}
 		r.enqueueTrackedUpload(uploadOp{
 			Kind:          opUploadRename,
 			Path:          rel,
@@ -862,17 +878,7 @@ func (r *reconciler) handleLocalFile(rel, abs string, info fs.FileInfo) {
 			StoredEntry:   candidate.entry,
 			HasStored:     true,
 		})
-		if hash != candidate.entry.LocalHash || uint32(info.Mode()&fs.ModePerm) != candidate.entry.Mode {
-			r.stageSyncEntry(rel, SyncEntry{
-				Type:          "file",
-				Mode:          uint32(info.Mode() & fs.ModePerm),
-				Size:          fileSize,
-				LocalHash:     hash,
-				LocalIdentity: localIdentity,
-				RemoteHash:    candidate.entry.RemoteHash,
-				LocalMtimeMs:  info.ModTime().UnixMilli(),
-				RemoteMtimeMs: candidate.entry.RemoteMtimeMs,
-			})
+		if changed {
 			r.enqueueTrackedUpload(uploadOp{
 				Kind:          opUploadFile,
 				Path:          rel,

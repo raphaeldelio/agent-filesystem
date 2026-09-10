@@ -378,3 +378,8 @@ upload. Deferred scans in a running daemon must stay on the warm merge path
 and retain recovery retries. Keep the uploaded snapshot's local timestamp
 separate from its Redis timestamp, preserve hashes during metadata refresh,
 and verify content and mode before creating a conflict copy.
+
+When a rename stages an edited destination, capture the final provisional
+baseline version before enqueueing the rename. A missing remote path followed
+by a failed or obsolete content upload must recover the local destination;
+it must not treat that provisional baseline as proof of a remote deletion.
