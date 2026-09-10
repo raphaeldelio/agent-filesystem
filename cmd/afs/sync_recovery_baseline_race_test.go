@@ -529,3 +529,91 @@ func TestSyncRecoveryDefersBothPathsOfQueuedRename(t *testing.T) {
 		t.Fatalf("remote rename = %q", got)
 	}
 }
+
+func TestSyncRecoveryRecreatesDestinationAfterMissingRenameSource(t *testing.T) {
+	env, d := recoveryBaselineDiagnostic(t)
+	ctx := context.Background()
+	oldPath := env.writeLocalFile(t, "old.txt", "keep this local content")
+	if err := d.full.warmStart(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	stored := d.Snapshot().Entries["old.txt"]
+	newPath := filepath.Join(env.localRoot, "new.txt")
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatal(err)
+	}
+	renameVersion := d.reconciler.installPendingRename("new.txt", localFileIdentityFromPath(newPath), stored)
+	d.reconciler.enqueueTrackedUpload(uploadOp{Kind: opUploadRename, Path: "new.txt", PrevPath: "old.txt", AbsPath: newPath, StoredEntry: stored, HasStored: true, RenameVersion: renameVersion})
+	// Model the source deletion committing before rename pairing observes
+	// the new local name, as seen in the AgentCore delete/create bursts.
+	if err := env.fsClient.Rm(ctx, "/old.txt"); err != nil {
+		t.Fatal(err)
+	}
+	d.uploader.process(ctx, nextDiagnosticUpload(t, d))
+	res := <-d.reconciler.uploadResCh
+	if !res.Skipped || res.Err != nil {
+		t.Fatalf("missing source rename = %+v", res)
+	}
+	d.reconciler.handleUploadResult(ctx, res)
+	if _, exists := d.Snapshot().Entries["new.txt"]; exists {
+		t.Fatal("failed rename retained an unsynced destination baseline")
+	}
+	if err := d.full.warmStart(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.readLocalFile(t, "new.txt"); got != "keep this local content" {
+		t.Fatalf("local destination = %q", got)
+	}
+	if got := env.readRemoteFile(t, "new.txt"); got != "keep this local content" {
+		t.Fatalf("remote destination = %q", got)
+	}
+	if len(d.reconciler.pendingUploads) != 0 {
+		t.Fatal("missing source kept pending paths")
+	}
+}
+
+func TestSyncRecoveryMissingRenameKeepsNewerDestinationState(t *testing.T) {
+	for _, deleted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "newer baseline", true: "deletion tombstone"}[deleted], func(t *testing.T) {
+			env, d := recoveryBaselineDiagnostic(t)
+			ctx := context.Background()
+			abs := env.writeLocalFile(t, "new.txt", "local content")
+			stored := SyncEntry{Type: "file", Mode: 0o644, Size: 13, LocalHash: sha256Hex([]byte("local content")), RemoteHash: sha256Hex([]byte("local content"))}
+			renameVersion := d.reconciler.installPendingRename("new.txt", localFileIdentityFromPath(abs), stored)
+			op := uploadOp{Kind: opUploadRename, Path: "new.txt", PrevPath: "old.txt", AbsPath: abs, StoredEntry: stored, HasStored: true, RenameVersion: renameVersion}
+			d.reconciler.enqueueTrackedUpload(op)
+			newer := stored
+			newer.Deleted = deleted
+			d.reconciler.stageSyncEntry("new.txt", newer)
+			before := d.Snapshot().Entries["new.txt"]
+			if deleted {
+				if err := os.Remove(abs); err != nil {
+					t.Fatal(err)
+				}
+				env.writeRemoteFile(t, "new.txt", "remote destination before user deleted it")
+			}
+			d.uploader.process(ctx, nextDiagnosticUpload(t, d))
+			res := <-d.reconciler.uploadResCh
+			if !res.Skipped || res.Err != nil {
+				t.Fatalf("missing source = %+v", res)
+			}
+			d.reconciler.handleUploadResult(ctx, res)
+			after, exists := d.Snapshot().Entries["new.txt"]
+			if !exists || after.Version != before.Version || after.Deleted != deleted {
+				t.Fatalf("newer destination state erased: before=%+v after=%+v", before, after)
+			}
+			if deleted {
+				if err := d.full.warmStart(ctx, nil); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Lstat(abs); !os.IsNotExist(err) {
+					t.Fatalf("deleted destination restored: %v", err)
+				}
+				remote, err := env.fsClient.Stat(ctx, "/new.txt")
+				if err != nil || remote != nil {
+					t.Fatalf("remote deletion lost: %+v, %v", remote, err)
+				}
+			}
+		})
+	}
+}

@@ -43,7 +43,8 @@ type uploadOp struct {
 	LocalMtimeMs  int64 // local metadata captured when the content was staged
 	StoredEntry   SyncEntry
 	HasStored     bool
-	Tracked       bool // reconciler keeps this operation pending through result application
+	Tracked       bool   // reconciler keeps this operation pending through result application
+	RenameVersion uint64 // provisional destination baseline installed when a rename was staged
 	// Chunked upload fields (set when file > chunkThreshold).
 	Chunked     bool
 	FileSize    int64
@@ -618,6 +619,13 @@ func (u *uploader) processRename(ctx context.Context, op uploadOp) {
 	srcPath := absoluteRemotePath(op.PrevPath)
 	dstPath := absoluteRemotePath(op.Path)
 	if err := u.fs.Rename(ctx, srcPath, dstPath, 0); err != nil {
+		if errors.Is(err, redis.Nil) || isClientNotFound(err) {
+			// A source or destination parent can disappear before a queued
+			// rename executes. Reconcile the current local destination rather
+			// than retaining a baseline for a rename that did not complete.
+			u.send(uploadResult{Op: op, Skipped: true})
+			return
+		}
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("rename remote %s -> %s: %w", op.PrevPath, op.Path, err)})
 		return
 	}
