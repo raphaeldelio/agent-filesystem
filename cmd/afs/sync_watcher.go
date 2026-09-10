@@ -42,7 +42,8 @@ type syncWatcher struct {
 	dirs    map[string]struct{} // absolute paths currently watched
 	stopped bool                // protected by mu; flush is a no-op once true
 
-	out chan LocalEvent
+	out    chan LocalEvent
+	rescan chan struct{} // separate from out so saturation cannot hide recovery
 }
 
 type pendingEvent struct {
@@ -71,6 +72,7 @@ func newSyncWatcher(root string, ignore *syncIgnore, debounce time.Duration) (*s
 		pending:  make(map[string]*pendingEvent),
 		dirs:     make(map[string]struct{}),
 		out:      make(chan LocalEvent, 1024),
+		rescan:   make(chan struct{}, 1),
 	}
 	if err := sw.addRecursive(sw.root); err != nil {
 		_ = w.Close()
@@ -79,10 +81,26 @@ func newSyncWatcher(root string, ignore *syncIgnore, debounce time.Duration) (*s
 	return sw, nil
 }
 
-// Events returns the read-only channel of coalesced events. It stays open
-// until run returns.
+// Events returns the read-only channel of coalesced events. It is never closed.
 func (s *syncWatcher) Events() <-chan LocalEvent {
 	return s.out
+}
+
+// Rescans signals that individual events were lost. The consumer removes the
+// token before scanning so another overflow during the scan queues a new pass.
+// Like Events, this channel is never closed; consumers stop through context.
+func (s *syncWatcher) Rescans() <-chan struct{} { return s.rescan }
+
+func (s *syncWatcher) requestRescan() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	select {
+	case s.rescan <- struct{}{}:
+	default:
+	}
 }
 
 // Close stops the underlying fsnotify watcher and cancels any pending timers.
@@ -108,6 +126,22 @@ func (s *syncWatcher) resetRecursive(root string) error {
 	if s.stopped {
 		s.mu.Unlock()
 		return nil
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("watch root %s is not a directory", root)
+	}
+	// A lost remove/recreate event can leave a watch on an old inode at
+	// the same path. Remove native watches as well as our bookkeeping.
+	for dir := range s.dirs {
+		if err := s.w.Remove(dir); err != nil && !errors.Is(err, fsnotify.ErrNonExistentWatch) {
+			s.mu.Unlock()
+			return err
+		}
 	}
 	s.dirs = make(map[string]struct{})
 	s.mu.Unlock()
@@ -149,6 +183,9 @@ func (s *syncWatcher) run(ctx context.Context) {
 			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "afs sync: watcher error: %v\n", err)
+				if errors.Is(err, fsnotify.ErrEventOverflow) {
+					s.requestRescan()
+				}
 			}
 		}
 	}
@@ -175,7 +212,9 @@ func (s *syncWatcher) handleEvent(ev fsnotify.Event) {
 		// New directory: walk it and install watches plus emit synthetic
 		// events for any pre-existing children, in case the user dropped a
 		// populated tree under the watch root.
-		_ = s.addRecursive(abs)
+		if err := s.addRecursive(abs); err != nil {
+			s.requestRescan()
+		}
 		_ = filepath.WalkDir(abs, func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return nil
@@ -200,6 +239,12 @@ func (s *syncWatcher) handleEvent(ev fsnotify.Event) {
 	}
 	if ev.Op&fsnotify.Remove != 0 || ev.Op&fsnotify.Rename != 0 {
 		s.removeWatch(abs)
+		// A queued event can describe an old directory inode after a scan
+		// restored watches on its replacement. Check again after removing
+		// watches so that stale events cannot leave the new tree unwatched.
+		if current, err := os.Lstat(abs); err == nil && current.IsDir() {
+			s.requestRescan()
+		}
 	}
 
 	if s.ignore.shouldIgnore(rel, isDir) {
@@ -257,16 +302,16 @@ func (s *syncWatcher) flush(rel string) {
 	select {
 	case out <- LocalEvent{Path: rel, KindHint: pe.kindHint}:
 	default:
-		// Output channel is saturated; drop this event but log so we can
-		// catch it in tests. The reconciler does a full sweep on backlog
-		// recovery so a dropped event is recoverable, just expensive.
+		// Recovery must not use the saturated event queue. Requests
+		// coalesce until consumed, including overflows during a scan.
+		s.requestRescan()
 		fmt.Fprintf(os.Stderr, "afs sync: watcher backpressure, dropped %s\n", rel)
 	}
 }
 
 // addRecursive walks a directory and installs an fsnotify watch on every
-// subdirectory found. Errors on individual subdirs are logged but do not
-// abort the walk.
+// subdirectory found. Vanished paths are skipped; other watch errors are
+// returned so callers can retry instead of treating missing watches as repaired.
 func (s *syncWatcher) addRecursive(root string) error {
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -286,16 +331,22 @@ func (s *syncWatcher) addRecursive(root string) error {
 			}
 		}
 		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			return filepath.SkipAll
+		}
 		if _, already := s.dirs[p]; already {
 			s.mu.Unlock()
 			return nil
 		}
-		s.mu.Unlock()
 		if err := s.w.Add(p); err != nil {
+			s.mu.Unlock()
 			fmt.Fprintf(os.Stderr, "afs sync: cannot watch %s: %v\n", p, err)
-			return nil
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
 		}
-		s.mu.Lock()
 		s.dirs[p] = struct{}{}
 		s.mu.Unlock()
 		return nil

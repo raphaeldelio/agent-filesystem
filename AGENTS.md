@@ -363,3 +363,11 @@ The most important implementation seams are:
   mint against the Agent Workspace manifest route and authorize sessions only
   for volumes attached to that manifest; do not route this command through the
   lower-level volume workspace token path.
+- Watcher overflow recovery must use a notification channel separate from the
+  saturated event queue. Consume the request before scanning so losses during
+  recovery schedule another pass. Refresh native directory watches and use a
+  warm scan; cold hydration can replace an unsynced tree containing only hidden
+  paths such as `.venv`.
+- After a reconciliation upload, record the remote modification time from
+  `Stat`. Substituting the local timestamp can create a false remote change
+  and turn a later local edit into a conflict during recovery.

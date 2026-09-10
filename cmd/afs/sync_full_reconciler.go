@@ -955,6 +955,13 @@ func (f *fullReconciler) execUpload(ctx context.Context, a syncAction) error {
 		mode = 0o644
 	}
 	_ = f.r.fs.Chmod(ctx, remotePath, mode)
+	remoteStat, err := f.r.fs.Stat(ctx, remotePath)
+	if err != nil {
+		return fmt.Errorf("stat uploaded %s: %w", a.path, err)
+	}
+	if remoteStat == nil {
+		return fmt.Errorf("uploaded file %s is missing remotely", a.path)
+	}
 
 	var localMtimeMs int64
 	if fi, err := os.Stat(a.absPath); err == nil {
@@ -967,7 +974,7 @@ func (f *fullReconciler) execUpload(ctx context.Context, a syncAction) error {
 		LocalHash:     hash,
 		RemoteHash:    hash,
 		LocalMtimeMs:  localMtimeMs,
-		RemoteMtimeMs: localMtimeMs, // best estimate without a Stat RPC; close enough for skip logic
+		RemoteMtimeMs: remoteStat.Mtime,
 		LastSyncedAt:  time.Now().UTC(),
 	})
 	return nil

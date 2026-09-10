@@ -259,6 +259,23 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 			select {
 			case <-dctx.Done():
 				return
+			case <-w.Rescans():
+				if err := d.recoverWatcherOverflow(dctx); err != nil {
+					if dctx.Err() != nil {
+						return
+					}
+					fmt.Fprintf(os.Stderr, "afs sync: watcher recovery failed, retrying: %v\n", err)
+					// Keep recovery pending through transient failures without
+					// spinning on an unavailable filesystem or Redis server.
+					timer := time.NewTimer(time.Second)
+					select {
+					case <-dctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+						w.requestRescan()
+					}
+				}
 			case <-d.reconciler.fullSweepRequests():
 				if err := d.full.run(dctx, nil); err != nil && !errors.Is(err, context.Canceled) {
 					fmt.Fprintf(os.Stderr, "afs sync: full reconcile failed: %v\n", err)
@@ -294,6 +311,15 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 	}()
 
 	return nil
+}
+
+func (d *syncDaemon) recoverWatcherOverflow(ctx context.Context) error {
+	if err := d.watcher.resetRecursive(d.cfg.LocalRoot); err != nil {
+		return fmt.Errorf("refresh watches: %w", err)
+	}
+	// This is an existing working directory. Cold-start hydration may
+	// replace a tree containing only hidden entries such as .venv.
+	return d.full.warmStart(ctx, nil)
 }
 
 func (d *syncDaemon) startQueryIndexWorker(ctx context.Context) {

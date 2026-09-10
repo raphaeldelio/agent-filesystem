@@ -38,6 +38,17 @@ debugging configuration.
 Use sync mode when humans, editors, language servers, tests, or shell tools need
 a normal directory on disk.
 
+Sync mode uploads local changes asynchronously. If the watcher output queue
+fills or the operating system reports an event overflow, AFS requests recovery
+through a separate notification channel. Recovery refreshes directory watches
+and reconciles the existing local tree with Redis. Repeated overflow requests
+coalesce, and a request received during a scan schedules another pass. Failed
+recovery attempts are logged and retried after a one second delay.
+
+Recovery follows the existing reconciliation and conflict rules. A successful
+local write does not wait for remote upload, so changes can still be lost if the
+local environment disappears before synchronization completes.
+
 Use live mount mode when you specifically need a live filesystem view. On macOS
 AFS uses NFS; on Linux it uses FUSE. Sync mode is usually the friendlier
 default.
