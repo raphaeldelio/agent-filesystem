@@ -251,16 +251,21 @@ readonly mounts and live FUSE or NFS mounts return errors.
 
 Save discovers the included local tree even when watcher notifications were
 missed, then verifies actual file bytes, types, permissions and symlink targets
-in Redis. The mount's ignore rules apply. The daemon resumes normal sync after
-the operation. Save does not create a checkpoint.
+in Redis. The mount's ignore rules apply. Save attempts to resume normal sync
+after the operation. If resuming fails, save returns an error and the mount
+must be restarted. Save does not create a checkpoint.
 
 | Option | Meaning |
 | --- | --- |
 | `--timeout <duration>` | Positive maximum wait, default `2m`. Accepts durations such as `30s` or `5m`. |
 | `--json` | Emit one JSON result on stdout for success or failure. |
 
-Flags may appear before or after the target. JSON results include `success`,
-`volume`, `local_root`, and an `error` on failure. A successful result includes
+Save scans and reads back the whole included tree. Larger trees may need a
+longer timeout.
+
+Flags may appear before or after the target. JSON results include `success`
+and an `error` on failure. The `volume` and `local_root` fields are included
+once the target is resolved. A successful result includes
 `save.entries`, `save.files`, `save.bytes`, `save.tree_sha256` and
 `save.completed_at`. Errors return a nonzero exit status.
 

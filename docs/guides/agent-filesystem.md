@@ -50,8 +50,9 @@ Save covers one complete active sync mount, including changes whose watcher
 events were missed. It applies the mount's ignore rules. Success means the
 included tree's actual file bytes, types, permissions and symlink targets were
 verified against Redis. The JSON result includes the volume, local root, entry
-and file counts, byte count, tree SHA256 and completion time. The daemon resumes
-normal synchronization after the operation.
+and file counts, byte count, tree SHA256 and completion time. Save attempts to
+resume normal synchronization after the operation. If resuming fails, save
+returns an error and the mount must be restarted.
 
 Conflicting local and remote changes, an unstable tree, failed operations, and
 timeout return failure. Some changes may already have reached Redis on failure;

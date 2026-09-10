@@ -186,6 +186,8 @@ The most important implementation seams are:
   sender before scanning or acknowledging a tree. Queue emptiness alone does
   not establish completion. Verify remote bytes and keep the stored hash format
   compatible with the chunk metadata used by subsequent background edits.
+  Cancel inbound replacements before they change the local tree, and compare
+  the local tree before and after draining active work.
 
 - Search/BM25 promotion in the Cloud UI should stay restrained and
   operational: prefer compact status text in existing workspace and monitor
