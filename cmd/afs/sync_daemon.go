@@ -281,8 +281,13 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 					}
 				}
 			case <-d.reconciler.fullSweepRequests():
-				if err := d.full.run(dctx, nil); err != nil && !errors.Is(err, context.Canceled) {
+				// Startup has already completed. A deferred recovery can leave
+				// only hidden local entries, which still must be merged safely.
+				if err := d.full.warmStart(dctx, nil); err != nil && !errors.Is(err, context.Canceled) {
 					fmt.Fprintf(os.Stderr, "afs sync: full reconcile failed: %v\n", err)
+					// Preserve the retry guarantee when an overflow scan deferred
+					// an upload and its result woke this ordinary sweep channel.
+					w.requestRescan()
 				}
 			case <-d.reconciler.rootReplaceRequests():
 				d.reconciler.suppressLocalEventsDuringRestore(true)

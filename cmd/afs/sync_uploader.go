@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -39,8 +40,10 @@ type uploadOp struct {
 	Symlink       string // target, only for opUploadSymlink
 	LocalHash     string // sha256 of Content or compositeHash for chunked
 	LocalIdentity string
+	LocalMtimeMs  int64 // local metadata captured when the content was staged
 	StoredEntry   SyncEntry
 	HasStored     bool
+	Tracked       bool // reconciler keeps this operation pending through result application
 	// Chunked upload fields (set when file > chunkThreshold).
 	Chunked     bool
 	FileSize    int64
@@ -55,6 +58,7 @@ type uploadResult struct {
 	Op             uploadOp
 	Err            error
 	Conflict       bool
+	Skipped        bool // queued local content changed; reconcile again without updating the baseline
 	RemoteHashSeen string
 	RemoteStat     *client.StatResult
 }
@@ -108,7 +112,7 @@ func (u *uploader) emitChange(ctx context.Context, r uploadResult) {
 	if u.rdb == nil || u.storageID == "" || u.sessionID == "" {
 		return
 	}
-	if r.Err != nil || r.Conflict {
+	if r.Err != nil || r.Conflict || r.Skipped {
 		return
 	}
 	entry := controlplane.ChangeEntry{
@@ -340,36 +344,52 @@ func (u *uploader) processFile(ctx context.Context, op uploadOp) {
 		u.processChunkedFile(ctx, op)
 		return
 	}
+	if !u.queuedFileCurrent(op) {
+		return
+	}
 	if int64(len(op.Content)) > u.maxFileBytes {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("file %s is %d bytes, exceeds sync size cap of %d bytes", op.Path, len(op.Content), u.maxFileBytes)})
 		return
 	}
 
-	// Drift check: if we have a stored RemoteHash, compare against the
-	// current remote state. If they differ, the remote moved while we held
-	// the local copy in our queue — that's a conflict.
+	mode := op.Mode
+	if mode == 0 {
+		mode = 0o644
+	}
+	// Recovery may have uploaded this content while the operation waited.
+	// Only divergent remote content is a conflict with the stored baseline.
 	remotePath := absoluteRemotePath(op.Path)
 	stat, statErr := u.fs.Stat(ctx, remotePath)
 	if statErr != nil && !isClientNotFound(statErr) {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("stat remote %s: %w", op.Path, statErr)})
 		return
 	}
-	if stat != nil && op.HasStored && op.StoredEntry.RemoteHash != "" {
+	if stat != nil {
 		remoteData, err := u.fs.Cat(ctx, remotePath)
 		if err != nil {
 			u.send(uploadResult{Op: op, Err: fmt.Errorf("read remote %s: %w", op.Path, err)})
 			return
 		}
+		if !u.queuedFileCurrent(op) {
+			return
+		}
 		remoteHash := sha256Hex(remoteData)
-		if remoteHash != op.StoredEntry.RemoteHash {
+		if remoteHash == op.LocalHash {
+			u.finishMatchingFileUpload(ctx, op, remotePath, mode)
+			return
+		}
+		matchesBaseline := remoteHash == op.StoredEntry.RemoteHash
+		if !matchesBaseline && op.StoredEntry.ChunkSize > 0 {
+			matchesBaseline = compositeHash(uploadChunkHashes(remoteData, op.StoredEntry.ChunkSize)) == op.StoredEntry.RemoteHash
+		}
+		if op.HasStored && op.StoredEntry.RemoteHash != "" && !matchesBaseline {
 			u.send(uploadResult{Op: op, Conflict: true, RemoteHashSeen: remoteHash, RemoteStat: stat})
 			return
 		}
 	}
 
-	mode := op.Mode
-	if mode == 0 {
-		mode = 0o644
+	if !u.queuedFileCurrent(op) {
+		return
 	}
 	// Echo handles both create-and-write and write-existing in a single
 	// round trip; the native client falls back to createFile when the
@@ -380,18 +400,13 @@ func (u *uploader) processFile(ctx context.Context, op uploadOp) {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("write remote %s: %w", op.Path, err)})
 		return
 	}
-	// Best-effort mode sync; ignore mode-only errors so transient
-	// permission errors don't block content propagation.
-	_ = u.fs.Chmod(ctx, remotePath, mode)
-	newStat, err := u.fs.Stat(ctx, remotePath)
-	if err != nil {
-		u.send(uploadResult{Op: op, Err: fmt.Errorf("post-write stat %s: %w", op.Path, err)})
-		return
-	}
-	u.send(uploadResult{Op: op, RemoteHashSeen: op.LocalHash, RemoteStat: newStat})
+	u.finishFileUpload(ctx, op, remotePath, mode)
 }
 
 func (u *uploader) processChunkedFile(ctx context.Context, op uploadOp) {
+	if !u.queuedFileCurrent(op) {
+		return
+	}
 	remotePath := absoluteRemotePath(op.Path)
 
 	// Drift check: compare remote chunk manifest against what we stored.
@@ -400,11 +415,29 @@ func (u *uploader) processChunkedFile(ctx context.Context, op uploadOp) {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("chunk meta %s: %w", op.Path, err)})
 		return
 	}
-	// If remote has chunks and they differ from our stored baseline, someone
-	// else changed the file → conflict.
-	if op.HasStored && op.StoredEntry.RemoteHash != "" && len(remoteHashes) > 0 {
+	// Echo uploads can leave absent or stale chunk metadata. Derive hashes
+	// from current bytes and accept either representation of the baseline.
+	if err == nil {
+		remoteData, readErr := u.fs.Cat(ctx, remotePath)
+		if readErr != nil {
+			u.send(uploadResult{Op: op, Err: fmt.Errorf("read remote %s: %w", op.Path, readErr)})
+			return
+		}
+		if !u.queuedFileCurrent(op) {
+			return
+		}
+		remoteHash := sha256Hex(remoteData)
+		remoteHashes = uploadChunkHashes(remoteData, op.ChunkSize)
 		remoteComposite := compositeHash(remoteHashes)
-		if remoteComposite != op.StoredEntry.RemoteHash {
+		if remoteComposite == op.LocalHash {
+			u.finishMatchingFileUpload(ctx, op, remotePath, op.Mode)
+			return
+		}
+		baselineComposite := remoteComposite
+		if op.StoredEntry.ChunkSize > 0 && op.StoredEntry.ChunkSize != op.ChunkSize {
+			baselineComposite = compositeHash(uploadChunkHashes(remoteData, op.StoredEntry.ChunkSize))
+		}
+		if op.HasStored && op.StoredEntry.RemoteHash != "" && remoteHash != op.StoredEntry.RemoteHash && baselineComposite != op.StoredEntry.RemoteHash {
 			stat, _ := u.fs.Stat(ctx, remotePath)
 			u.send(uploadResult{Op: op, Conflict: true, RemoteHashSeen: remoteComposite, RemoteStat: stat})
 			return
@@ -419,7 +452,14 @@ func (u *uploader) processChunkedFile(ctx context.Context, op uploadOp) {
 			u.send(uploadResult{Op: op, Err: fmt.Errorf("read chunk %d of %s: %w", idx, op.Path, err)})
 			return
 		}
+		if idx >= len(op.ChunkHashes) || sha256Hex(data) != op.ChunkHashes[idx] {
+			u.send(uploadResult{Op: op, Skipped: true})
+			return
+		}
 		chunks[idx] = data
+	}
+	if !u.queuedFileCurrent(op) {
+		return
 	}
 
 	// If file doesn't exist remotely yet, create it first.
@@ -436,13 +476,87 @@ func (u *uploader) processChunkedFile(ctx context.Context, op uploadOp) {
 		return
 	}
 
-	_ = u.fs.Chmod(ctx, remotePath, op.Mode)
+	u.finishFileUpload(ctx, op, remotePath, op.Mode)
+}
+
+func (u *uploader) finishFileUpload(ctx context.Context, op uploadOp, remotePath string, mode uint32) {
+	// Retain mode propagation even when recovery already uploaded the bytes.
+	_ = u.fs.Chmod(ctx, remotePath, mode)
 	newStat, err := u.fs.Stat(ctx, remotePath)
 	if err != nil {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("post-write stat %s: %w", op.Path, err)})
 		return
 	}
 	u.send(uploadResult{Op: op, RemoteHashSeen: op.LocalHash, RemoteStat: newStat})
+}
+
+func (u *uploader) finishMatchingFileUpload(ctx context.Context, op uploadOp, remotePath string, mode uint32) {
+	stat, err := u.fs.Stat(ctx, remotePath)
+	if err != nil {
+		u.send(uploadResult{Op: op, Err: fmt.Errorf("stat matching remote %s: %w", op.Path, err)})
+		return
+	}
+	if !u.queuedFileCurrent(op) {
+		return
+	}
+	if stat == nil || stat.Type != "file" {
+		u.send(uploadResult{Op: op, Skipped: true})
+		return
+	}
+	if op.HasStored && op.StoredEntry.Mode != 0 && stat.Mode != op.StoredEntry.Mode && stat.Mode != mode {
+		if mode == op.StoredEntry.Mode {
+			// Only the remote mode changed. A rescan can apply that change.
+			u.send(uploadResult{Op: op, Skipped: true})
+		} else {
+			u.send(uploadResult{Op: op, Conflict: true, RemoteHashSeen: op.LocalHash, RemoteStat: stat})
+		}
+		return
+	}
+	u.finishFileUpload(ctx, op, remotePath, mode)
+}
+
+func (u *uploader) queuedFileCurrent(op uploadOp) bool {
+	// Older callers did not capture metadata with the staged content.
+	if op.LocalMtimeMs == 0 {
+		return true
+	}
+	info, err := os.Lstat(op.AbsPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		u.send(uploadResult{Op: op, Err: fmt.Errorf("stat queued file %s: %w", op.Path, err)})
+		return false
+	}
+	size := int64(len(op.Content))
+	if op.Chunked {
+		size = op.FileSize
+	}
+	if err != nil || !info.Mode().IsRegular() || info.ModTime().UnixMilli() != op.LocalMtimeMs || info.Size() != size || uint32(info.Mode().Perm()) != op.Mode || op.LocalIdentity != "" && localFileIdentity(info) != op.LocalIdentity {
+		u.send(uploadResult{Op: op, Skipped: true})
+		return false
+	}
+	if !op.Chunked {
+		data, readErr := os.ReadFile(op.AbsPath)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			u.send(uploadResult{Op: op, Err: fmt.Errorf("read queued file %s: %w", op.Path, readErr)})
+			return false
+		}
+		if readErr != nil || !bytes.Equal(data, op.Content) {
+			u.send(uploadResult{Op: op, Skipped: true})
+			return false
+		}
+	}
+	return true
+}
+
+func uploadChunkHashes(data []byte, chunkSize int) []string {
+	if chunkSize <= 0 {
+		chunkSize = defaultChunkSize
+	}
+	var hashes []string
+	for offset := 0; offset < len(data); offset += chunkSize {
+		end := min(offset+chunkSize, len(data))
+		hashes = append(hashes, sha256Hex(data[offset:end]))
+	}
+	return hashes
 }
 
 func (u *uploader) processSymlink(ctx context.Context, op uploadOp) {
@@ -477,8 +591,19 @@ func (u *uploader) processMkdir(ctx context.Context, op uploadOp) {
 }
 
 func (u *uploader) processDelete(ctx context.Context, op uploadOp) {
+	if op.AbsPath != "" {
+		_, err := os.Lstat(op.AbsPath)
+		if err == nil {
+			u.send(uploadResult{Op: op, Skipped: true})
+			return
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			u.send(uploadResult{Op: op, Err: fmt.Errorf("stat queued delete %s: %w", op.Path, err)})
+			return
+		}
+	}
 	remotePath := absoluteRemotePath(op.Path)
-	if err := u.fs.Rm(ctx, remotePath); err != nil && !isClientNotFound(err) {
+	if err := u.fs.Rm(ctx, remotePath); err != nil && !errors.Is(err, redis.Nil) && !isClientNotFound(err) {
 		u.send(uploadResult{Op: op, Err: fmt.Errorf("rm remote %s: %w", op.Path, err)})
 		return
 	}

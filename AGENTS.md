@@ -371,3 +371,10 @@ The most important implementation seams are:
 - After a reconciliation upload, record the remote modification time from
   `Stat`. Substituting the local timestamp can create a false remote change
   and turn a later local edit into a conflict during recovery.
+
+Overflow scans must defer files with queued uploads until their results update
+the baseline. An existing remote inode can still contain a partial chunked
+upload. Deferred scans in a running daemon must stay on the warm merge path
+and retain recovery retries. Keep the uploaded snapshot's local timestamp
+separate from its Redis timestamp, preserve hashes during metadata refresh,
+and verify content and mode before creating a conflict copy.
