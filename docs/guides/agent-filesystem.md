@@ -45,6 +45,11 @@ and reconciles the existing local tree with Redis. Repeated overflow requests
 coalesce, and a request received during a scan schedules another pass. Failed
 recovery attempts are logged and retried after a one second delay.
 
+While applying changes beneath read-only local directories, reconciliation
+temporarily grants owner access and restores their permissions after the
+changes finish. Permissions are also restored when a pass fails or is cancelled,
+so a later retry can resume an incomplete directory download.
+
 Set the event buffer with `afs config set sync.watcherQueueCapacity 8192`.
 The default is 1024 events per sync daemon. Values from 1 through 1048576 are
 accepted; 0 or `afs config unset sync.watcherQueueCapacity` restores the default.

@@ -689,7 +689,11 @@ func metaMatch(l, r observedMeta, stored SyncEntry, hasStored bool) bool {
 }
 
 // executePlan runs the planned actions with a bounded worker pool.
-func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onProgress ProgressFunc) error {
+func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onProgress ProgressFunc) (result error) {
+	directoryModes := newSyncDirectoryModes(f.r)
+	defer func() {
+		result = errors.Join(result, directoryModes.restore())
+	}()
 	// Separate actions whose ordering matters from the parallel file ops.
 	// Dirs must happen first so parent directories exist before child writes.
 	// Deletes run deepest-path-first so non-empty remote directories are
@@ -705,6 +709,14 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 			fileActions = append(fileActions, a)
 		}
 	}
+	sort.SliceStable(dirActions, func(i, j int) bool {
+		leftDepth := strings.Count(dirActions[i].path, "/")
+		rightDepth := strings.Count(dirActions[j].path, "/")
+		if leftDepth != rightDepth {
+			return leftDepth < rightDepth
+		}
+		return dirActions[i].path < dirActions[j].path
+	})
 	sort.SliceStable(deleteActions, func(i, j int) bool {
 		leftDepth := strings.Count(deleteActions[i].path, "/")
 		rightDepth := strings.Count(deleteActions[j].path, "/")
@@ -728,11 +740,36 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if a.kind == "mkdir-local" {
+			if err := directoryModes.prepare(filepath.Dir(a.absPath)); err != nil {
+				return err
+			}
+		}
 		if err := f.executeAction(ctx, a); err != nil {
 			return err
 		}
+		if a.kind == "mkdir-local" {
+			if err := directoryModes.prepare(a.absPath); err != nil {
+				return err
+			}
+		}
 		done.Add(1)
 		report()
+	}
+
+	// Existing directories may already have their final restrictive modes
+	// and therefore have no mkdir action. Reopen parents before local writes
+	// or deletes; restore only after all parallel workers have joined.
+	for _, a := range plan {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		switch a.kind {
+		case "download", "symlink-download", "delete-local":
+			if err := directoryModes.prepare(filepath.Dir(a.absPath)); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Phase 2: ordered deletes (serial, dependency-sensitive).
@@ -782,6 +819,9 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 	}
 	wg.Wait()
 	f.r.state.markDirty()
+	if firstErr == nil {
+		return ctx.Err()
+	}
 	return firstErr
 }
 
