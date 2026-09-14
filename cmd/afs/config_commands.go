@@ -742,6 +742,7 @@ Common keys:
   mode
   redis.url
   sync.fileSizeCapMB
+  sync.watcherQueueCapacity
 
 Examples:
   %s config get redis.url
@@ -800,14 +801,16 @@ Examples:
   %s config set mode mount
   %s config set agent.name "Claude Code"
   %s config set sync.fileSizeCapMB 4096
+  %s config set sync.watcherQueueCapacity 8192
   %s config set controlPlane.url http://127.0.0.1:8091
 
 Notes:
   Keys are case-insensitive.
+  sync.watcherQueueCapacity accepts 1..1048576; 0 resets to 1024.
   Use "self-managed" for the control-plane-backed mode.
   Volume mounts are runtime state; use '%s vol mount <volume> <directory>'.
   Default volume is managed with '%s vol set-default <volume>'.
-`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
+`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
 }
 
 func configUnsetUsageText(bin string) string {
@@ -936,6 +939,9 @@ func configSummaryRows(cfg config, source string) []outputRow {
 	if cfg.SyncFileSizeCapMB > 0 && cfg.SyncFileSizeCapMB != defaultSyncFileSizeCapMB {
 		rows = append(rows, outputRow{Label: "sync file cap", Value: strconv.Itoa(cfg.SyncFileSizeCapMB) + " MB"})
 	}
+	if capacity := syncWatcherQueueCapacity(cfg); capacity != defaultSyncWatcherQueueCapacity {
+		rows = append(rows, outputRow{Label: "watcher queue", Value: strconv.Itoa(capacity) + " events"})
+	}
 	return rows
 }
 
@@ -960,6 +966,7 @@ func configKeys() []string {
 		"mode",
 		"redis.url",
 		"sync.fileSizeCapMB",
+		"sync.watcherQueueCapacity",
 	}
 }
 
@@ -1021,6 +1028,8 @@ func normalizeConfigKey(key string) string {
 		return "redis.url"
 	case "sync.filesizecapmb", "sync.file.size.cap.mb", "syncfilecap", "syncfilesizecapmb":
 		return "sync.fileSizeCapMB"
+	case "sync.watcherqueuecapacity", "syncwatcherqueuecapacity":
+		return "sync.watcherQueueCapacity"
 	default:
 		return strings.TrimSpace(key)
 	}
@@ -1055,6 +1064,8 @@ func getConfigKey(cfg config, key string) (string, error) {
 			mb = defaultSyncFileSizeCapMB
 		}
 		return strconv.Itoa(mb), nil
+	case "sync.watcherQueueCapacity":
+		return strconv.Itoa(syncWatcherQueueCapacity(cfg)), nil
 	default:
 		return "", fmt.Errorf("unknown config key %q", key)
 	}
@@ -1106,6 +1117,15 @@ func setConfigKey(cfg *config, key, value string) error {
 			return fmt.Errorf("sync.fileSizeCapMB must be a non-negative integer")
 		}
 		cfg.SyncFileSizeCapMB = mb
+	case "sync.watcherQueueCapacity":
+		capacity, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("sync.watcherQueueCapacity must be an integer between 1 and %d, or 0 for the default", maxSyncWatcherQueueCapacity)
+		}
+		if err := validateSyncWatcherQueueCapacity(capacity); err != nil {
+			return err
+		}
+		cfg.SyncWatcherQueueCapacity = capacity
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}
@@ -1139,6 +1159,8 @@ func unsetConfigKey(cfg *config, key string) error {
 		cfg.RedisTLS = false
 	case "sync.fileSizeCapMB":
 		cfg.SyncFileSizeCapMB = def.SyncFileSizeCapMB
+	case "sync.watcherQueueCapacity":
+		cfg.SyncWatcherQueueCapacity = def.SyncWatcherQueueCapacity
 	default:
 		return fmt.Errorf("unknown config key %q", key)
 	}

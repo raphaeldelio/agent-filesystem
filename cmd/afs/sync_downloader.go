@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -49,12 +51,14 @@ type downloadOp struct {
 type downloadResult struct {
 	Op           downloadOp
 	Err          error
+	Skipped      bool // local changed since staging; reconcile again without adopting this result
 	RemoteHash   string
 	RemoteStat   *client.StatResult
 	ConflictPath string // populated when Conflict is true and the local file was preserved
 	Mode         uint32
 	Size         int64
 	MtimeMs      int64
+	LocalMtimeMs int64
 	Target       string // for symlinks
 }
 
@@ -124,6 +128,11 @@ func (d *downloader) processFile(ctx context.Context, op downloadOp) {
 		d.processChunkedFile(ctx, op)
 		return
 	}
+	local, err := snapshotDownloadLocal(op.AbsPath, op.StoredEntry)
+	if err != nil {
+		d.send(downloadResult{Op: op, Err: err})
+		return
+	}
 	remotePath := absoluteRemotePath(op.Path)
 	stat, err := d.fs.Stat(ctx, remotePath)
 	if err != nil && !isClientNotFound(err) {
@@ -136,6 +145,10 @@ func (d *downloader) processFile(ctx context.Context, op downloadOp) {
 	if stat == nil {
 		// Treat as a delete: the inode vanished between the invalidation
 		// dispatch and our follow-up read.
+		if !local.unchanged(op.AbsPath) || !local.matchesStored(op) {
+			d.send(downloadResult{Op: op, Skipped: true})
+			return
+		}
 		op.Kind = opDownloadDelete
 		d.processDelete(ctx, op)
 		return
@@ -164,34 +177,79 @@ func (d *downloader) processFile(ctx context.Context, op downloadOp) {
 		return
 	}
 	hash := sha256Hex(data)
-
+	mode := stat.Mode
 	if d.readonly {
-		// Mark read-only files in readonly mode (0444).
-		stat.Mode = 0o444
+		mode = 0o444
+	}
+	if !local.unchanged(op.AbsPath) {
+		d.send(downloadResult{Op: op, Skipped: true})
+		return
+	}
+	if local.info != nil && local.info.Mode().IsRegular() && local.hash == hash && uint32(local.info.Mode().Perm()) == mode&0o777 {
+		d.sendFileResult(op, stat, hash, "", mode, int64(len(data)))
+		return
+	}
+	if !op.Conflict && !local.matchesStored(op) {
+		d.send(downloadResult{Op: op, Skipped: true})
+		return
 	}
 
-	conflictPath, err := d.writeLocalFile(ctx, op, stat.Mode, func(file *os.File) error {
+	conflictPath, err := d.writeLocalFile(ctx, op, mode, func(file *os.File) error {
 		_, err := file.Write(data)
 		return err
 	})
 	if err != nil {
-		d.send(downloadResult{Op: op, Err: fmt.Errorf("write local %s: %w", op.Path, err)})
+		d.send(downloadResult{Op: op, Skipped: errors.Is(err, errSyncDownloadLocalChanged), Err: fmt.Errorf("write local %s: %w", op.Path, err)})
 		return
 	}
 	d.echo.markFile(op.Path, hash)
 
+	d.sendFileResult(op, stat, hash, conflictPath, mode, int64(len(data)))
+}
+
+func (d *downloader) sendFileResult(op downloadOp, stat *client.StatResult, hash, conflictPath string, mode uint32, size int64) {
+	info, err := os.Lstat(op.AbsPath)
+	if err != nil {
+		d.send(downloadResult{Op: op, Err: err})
+		return
+	}
 	d.send(downloadResult{
 		Op:           op,
 		RemoteHash:   hash,
 		RemoteStat:   stat,
 		ConflictPath: conflictPath,
-		Mode:         stat.Mode,
-		Size:         stat.Size,
+		Mode:         mode,
+		Size:         size,
 		MtimeMs:      stat.Mtime,
+		LocalMtimeMs: info.ModTime().UnixMilli(),
 	})
 }
 
 func (d *downloader) processChunkedFile(ctx context.Context, op downloadOp) {
+	if op.Conflict {
+		// Moving a conflict aside removes the unchanged local chunks too.
+		// Materialize the whole remote file instead of patching a new file.
+		op.Chunked, op.FileSize, op.ChunkSize = false, 0, 0
+		op.ChunkHashes, op.DirtyChunks = nil, nil
+		d.processFile(ctx, op)
+		return
+	}
+	local, err := snapshotDownloadLocal(op.AbsPath, op.StoredEntry)
+	if err != nil {
+		d.send(downloadResult{Op: op, Err: err})
+		return
+	}
+	if local.info == nil || !op.HasStored || op.StoredEntry.ChunkSize != op.ChunkSize {
+		// A delta requires the original complete file as its base.
+		op.Chunked, op.FileSize, op.ChunkSize = false, 0, 0
+		op.ChunkHashes, op.DirtyChunks = nil, nil
+		d.processFile(ctx, op)
+		return
+	}
+	if !local.matchesStored(op) {
+		d.send(downloadResult{Op: op, Skipped: true})
+		return
+	}
 	remotePath := absoluteRemotePath(op.Path)
 	stat, err := d.fs.Stat(ctx, remotePath)
 	if err != nil && !isClientNotFound(err) {
@@ -202,6 +260,10 @@ func (d *downloader) processChunkedFile(ctx context.Context, op downloadOp) {
 		return
 	}
 	if stat == nil {
+		if !local.unchanged(op.AbsPath) {
+			d.send(downloadResult{Op: op, Skipped: true})
+			return
+		}
 		op.Kind = opDownloadDelete
 		d.processDelete(ctx, op)
 		return
@@ -217,14 +279,29 @@ func (d *downloader) processChunkedFile(ctx context.Context, op downloadOp) {
 	if d.cancelled(ctx, op) {
 		return
 	}
+	if !local.unchanged(op.AbsPath) {
+		d.send(downloadResult{Op: op, Skipped: true})
+		return
+	}
+	for _, idx := range op.DirtyChunks {
+		if idx < 0 || idx >= len(op.ChunkHashes) || sha256Hex(chunkData[idx]) != op.ChunkHashes[idx] {
+			d.send(downloadResult{Op: op, Skipped: true})
+			return
+		}
+	}
 
 	mode := stat.Mode
 	if d.readonly {
 		mode = 0o444
 	}
+	hash := compositeHash(op.ChunkHashes)
+	if local.baselineHash == hash && local.info.Size() == op.FileSize && uint32(local.info.Mode().Perm()) == mode&0o777 {
+		d.sendFileResult(op, stat, hash, "", mode, op.FileSize)
+		return
+	}
 
 	// Patch a sibling file so cancellation cannot leave partial local bytes.
-	conflictPath, err := d.writeLocalFile(ctx, op, mode, func(file *os.File) error {
+	_, err = d.writeLocalFile(ctx, op, mode, func(file *os.File) error {
 		local, err := os.OpenFile(op.AbsPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if err == nil {
 			defer local.Close()
@@ -252,31 +329,93 @@ func (d *downloader) processChunkedFile(ctx context.Context, op downloadOp) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if op.FileSize > 0 {
-			return file.Truncate(op.FileSize)
-		}
-		return nil
+		return file.Truncate(op.FileSize)
 	})
+	if err != nil {
+		d.send(downloadResult{Op: op, Skipped: errors.Is(err, errSyncDownloadLocalChanged), Err: err})
+		return
+	}
+
+	d.echo.markFile(op.Path, hash)
+	d.sendFileResult(op, stat, hash, "", mode, op.FileSize)
+}
+
+// The persisted baseline detects queued overwrites of newer local edits. A
+// second stat check detects edits or replacements while remote reads run.
+type downloadLocalSnapshot struct {
+	info         fs.FileInfo
+	hash         string
+	baselineHash string
+	target       string
+}
+
+func snapshotDownloadLocal(abs string, stored SyncEntry) (downloadLocalSnapshot, error) {
+	s := downloadLocalSnapshot{}
+	info, err := os.Lstat(abs)
+	if os.IsNotExist(err) {
+		return s, nil
+	}
+	if err != nil {
+		return s, err
+	}
+	s.info = info
+	if info.Mode()&os.ModeSymlink != 0 {
+		s.target, err = os.Readlink(abs)
+	} else if info.Mode().IsRegular() {
+		f, openErr := os.Open(abs)
+		if openErr != nil {
+			return s, openErr
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		closeErr := f.Close()
+		if err == nil {
+			err = closeErr
+		}
+		s.hash = hex.EncodeToString(h.Sum(nil))
+		s.baselineHash = s.hash
+		if err == nil && stored.ChunkSize > 0 {
+			var hashes []string
+			hashes, _, err = streamChunkHashes(abs, stored.ChunkSize)
+			s.baselineHash = compositeHash(hashes)
+		}
+	}
+	return s, err
+}
+
+func (s downloadLocalSnapshot) unchanged(abs string) bool {
+	now, err := os.Lstat(abs)
+	if s.info == nil {
+		return os.IsNotExist(err)
+	}
+	return err == nil && os.SameFile(s.info, now) && s.info.Mode() == now.Mode() && s.info.Size() == now.Size() && s.info.ModTime().Equal(now.ModTime())
+}
+
+func (s downloadLocalSnapshot) matchesStored(op downloadOp) bool {
+	if s.info == nil {
+		return !op.HasStored || op.StoredEntry.Deleted
+	}
+	if !op.HasStored || op.StoredEntry.Deleted {
+		return false
+	}
+	stored := op.StoredEntry
+	switch {
+	case s.info.Mode().IsRegular():
+		return stored.Type == "file" && uint32(s.info.Mode().Perm()) == stored.Mode&0o777 && s.info.Size() == stored.Size && stored.LocalHash != "" && (s.hash == stored.LocalHash || s.baselineHash == stored.LocalHash)
+	case s.info.Mode()&os.ModeSymlink != 0:
+		return stored.Type == "symlink" && s.target == stored.Target
+	case s.info.IsDir():
+		return stored.Type == "dir" && uint32(s.info.Mode().Perm()) == stored.Mode&0o777
+	}
+	return false
+}
+
+func (d *downloader) processSymlink(ctx context.Context, op downloadOp) {
+	local, err := snapshotDownloadLocal(op.AbsPath, op.StoredEntry)
 	if err != nil {
 		d.send(downloadResult{Op: op, Err: err})
 		return
 	}
-
-	hash := compositeHash(op.ChunkHashes)
-	d.echo.markFile(op.Path, hash)
-
-	d.send(downloadResult{
-		Op:           op,
-		RemoteHash:   hash,
-		RemoteStat:   stat,
-		ConflictPath: conflictPath,
-		Mode:         mode,
-		Size:         op.FileSize,
-		MtimeMs:      stat.Mtime,
-	})
-}
-
-func (d *downloader) processSymlink(ctx context.Context, op downloadOp) {
 	if op.Symlink == "" {
 		remotePath := absoluteRemotePath(op.Path)
 		target, err := d.fs.Readlink(ctx, remotePath)
@@ -287,6 +426,18 @@ func (d *downloader) processSymlink(ctx context.Context, op downloadOp) {
 		op.Symlink = target
 	}
 	if d.cancelled(ctx, op) {
+		return
+	}
+	if !local.unchanged(op.AbsPath) {
+		d.send(downloadResult{Op: op, Skipped: true})
+		return
+	}
+	if local.info != nil && local.info.Mode()&os.ModeSymlink != 0 && local.target == op.Symlink {
+		d.send(downloadResult{Op: op, Target: op.Symlink, LocalMtimeMs: local.info.ModTime().UnixMilli()})
+		return
+	}
+	if !op.Conflict && !local.matchesStored(op) {
+		d.send(downloadResult{Op: op, Skipped: true})
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(op.AbsPath), 0o755); err != nil {
@@ -311,7 +462,18 @@ func (d *downloader) processSymlink(ctx context.Context, op downloadOp) {
 	if d.cancelled(ctx, op) {
 		return
 	}
-	if statErr == nil && info.IsDir() {
+	var conflictPath string
+	if !local.unchanged(op.AbsPath) {
+		d.send(downloadResult{Op: op, Skipped: true})
+		return
+	}
+	if op.Conflict {
+		conflictPath, err = moveLocalToConflict(d.conflict, op.AbsPath)
+		if err != nil {
+			d.send(downloadResult{Op: op, Err: err})
+			return
+		}
+	} else if statErr == nil && info.IsDir() {
 		// Preserve the existing behavior for replacing an empty directory.
 		if err := os.Remove(op.AbsPath); err != nil {
 			d.send(downloadResult{Op: op, Err: err})
@@ -323,7 +485,12 @@ func (d *downloader) processSymlink(ctx context.Context, op downloadOp) {
 		return
 	}
 	d.echo.markSymlink(op.Path, op.Symlink)
-	d.send(downloadResult{Op: op, Target: op.Symlink})
+	info, err = os.Lstat(op.AbsPath)
+	if err != nil {
+		d.send(downloadResult{Op: op, Err: err})
+		return
+	}
+	d.send(downloadResult{Op: op, Target: op.Symlink, ConflictPath: conflictPath, LocalMtimeMs: info.ModTime().UnixMilli()})
 }
 
 func (d *downloader) processMkdir(ctx context.Context, op downloadOp) {
@@ -381,6 +548,8 @@ func (d *downloader) cancelled(ctx context.Context, op downloadOp) bool {
 	return false
 }
 
+var errSyncDownloadLocalChanged = errors.New("local destination changed while staging download")
+
 // Stage bytes before replacing the destination. Cancelled downloads discard
 // their temporary files without moving the local file to a conflict copy.
 func (d *downloader) writeLocalFile(ctx context.Context, op downloadOp, mode uint32, write func(*os.File) error) (string, error) {
@@ -393,6 +562,11 @@ func (d *downloader) writeLocalFile(ctx context.Context, op downloadOp, mode uin
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	info, err := os.Lstat(op.AbsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	local := downloadLocalSnapshot{info: info}
 	file, err := os.CreateTemp(filepath.Dir(op.AbsPath), "."+filepath.Base(op.AbsPath)+".afssync.tmp.*")
 	if err != nil {
 		return "", err
@@ -413,6 +587,9 @@ func (d *downloader) writeLocalFile(ctx context.Context, op downloadOp, mode uin
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	if !local.unchanged(op.AbsPath) {
+		return "", errSyncDownloadLocalChanged
 	}
 	var conflictPath string
 	if op.Conflict {

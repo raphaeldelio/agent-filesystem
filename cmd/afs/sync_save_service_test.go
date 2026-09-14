@@ -138,7 +138,7 @@ func TestSyncSaveServiceCancelsFullQueuesAndDelayedDeletes(t *testing.T) {
 	}
 	// Fill both directions with no consumer. Cancellation must unblock every sender.
 	stop := make(chan struct{})
-	r := &reconciler{stopCh: stop, uploadCh: make(chan uploadOp, 1), downloadCh: make(chan downloadOp, 1)}
+	r := &reconciler{state: newStateWriter(newSyncState("queued", t.TempDir()), time.Second), stopCh: stop, uploadCh: make(chan uploadOp, 1), downloadCh: make(chan downloadOp, 1)}
 	r.uploadCh <- uploadOp{}
 	r.downloadCh <- downloadOp{}
 	up := make(chan uploadResult, 1)
@@ -147,13 +147,14 @@ func TestSyncSaveServiceCancelsFullQueuesAndDelayedDeletes(t *testing.T) {
 	down <- downloadResult{}
 	u := &uploader{stopCh: stop, results: up}
 	downloader := &downloader{stopCh: stop, results: down}
-	finished := make(chan struct{}, 4)
+	finished := make(chan struct{}, 5)
 	go func() { r.queueUpload(uploadOp{}); finished <- struct{}{} }()
+	go func() { r.enqueueTrackedUpload(uploadOp{Path: "pending"}); finished <- struct{}{} }()
 	go func() { r.queueDownload(downloadOp{}); finished <- struct{}{} }()
 	go func() { u.send(uploadResult{}); finished <- struct{}{} }()
 	go func() { downloader.send(downloadResult{}); finished <- struct{}{} }()
 	close(stop)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 5; i++ {
 		select {
 		case <-finished:
 		case <-time.After(time.Second):

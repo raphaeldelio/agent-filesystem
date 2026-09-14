@@ -166,21 +166,22 @@ func startSyncServices(cfg config, foreground bool) error {
 	bootStep := startStep("Syncing workspace")
 	fsClient := client.New(rdb, bootstrap.redisKey)
 	daemon, err := newSyncDaemon(syncDaemonConfig{
-		Workspace:        bootstrap.workspace,
-		LocalRoot:        localRoot,
-		FS:               fsClient,
-		Store:            store,
-		MaxFileBytes:     syncSizeCapBytes(runtimeCfg),
-		Readonly:         runtimeCfg.ReadOnly,
-		Interactive:      foreground,
-		Rdb:              rdb,
-		QueryIndexFSKey:  bootstrap.redisKey,
-		StorageID:        syncVersioningStorageID(runtimeCfg, bootstrap.workspace),
-		HeadCheckpointID: bootstrap.headCheckpoint,
-		SessionID:        bootstrap.sessionID,
-		AgentID:          runtimeCfg.ID,
-		Label:            runtimeCfg.Name,
-		AgentVersion:     version.String(),
+		Workspace:            bootstrap.workspace,
+		LocalRoot:            localRoot,
+		FS:                   fsClient,
+		Store:                store,
+		MaxFileBytes:         syncSizeCapBytes(runtimeCfg),
+		WatcherQueueCapacity: syncWatcherQueueCapacity(runtimeCfg),
+		Readonly:             runtimeCfg.ReadOnly,
+		Interactive:          foreground,
+		Rdb:                  rdb,
+		QueryIndexFSKey:      bootstrap.redisKey,
+		StorageID:            syncVersioningStorageID(runtimeCfg, bootstrap.workspace),
+		HeadCheckpointID:     bootstrap.headCheckpoint,
+		SessionID:            bootstrap.sessionID,
+		AgentID:              runtimeCfg.ID,
+		Label:                runtimeCfg.Name,
+		AgentVersion:         version.String(),
 	})
 	if err != nil {
 		bootStep.fail(err.Error())
@@ -415,19 +416,20 @@ func runSyncDaemon() error {
 
 	fsClient := client.New(rdb, mountKey)
 	daemon, err := newSyncDaemon(syncDaemonConfig{
-		Workspace:       workspace,
-		LocalRoot:       localRoot,
-		FS:              fsClient,
-		Store:           store,
-		MaxFileBytes:    syncSizeCapBytes(cfg),
-		Readonly:        cfg.ReadOnly,
-		Rdb:             rdb,
-		QueryIndexFSKey: mountKey,
-		StorageID:       syncVersioningStorageID(cfg, workspace),
-		SessionID:       sessionID,
-		AgentID:         cfg.ID,
-		Label:           cfg.Name,
-		AgentVersion:    version.String(),
+		Workspace:            workspace,
+		LocalRoot:            localRoot,
+		FS:                   fsClient,
+		Store:                store,
+		MaxFileBytes:         syncSizeCapBytes(cfg),
+		WatcherQueueCapacity: syncWatcherQueueCapacity(cfg),
+		Readonly:             cfg.ReadOnly,
+		Rdb:                  rdb,
+		QueryIndexFSKey:      mountKey,
+		StorageID:            syncVersioningStorageID(cfg, workspace),
+		SessionID:            sessionID,
+		AgentID:              cfg.ID,
+		Label:                cfg.Name,
+		AgentVersion:         version.String(),
 	})
 	if err != nil {
 		return failSyncDaemonReady(readyPath, err)

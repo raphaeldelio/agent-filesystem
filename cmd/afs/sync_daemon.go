@@ -20,14 +20,15 @@ import (
 // grouped by concern: the workspace and root path, the Redis client, and
 // optional knobs (size cap, debounce, readonly).
 type syncDaemonConfig struct {
-	Workspace       string
-	LocalRoot       string // absolute, will be created if missing
-	FS              client.Client
-	Store           *afsStore
-	MaxFileBytes    int64
-	WatcherDebounce time.Duration
-	Readonly        bool
-	Interactive     bool // when true, log every file event to stderr
+	Workspace            string
+	LocalRoot            string // absolute, will be created if missing
+	FS                   client.Client
+	Store                *afsStore
+	MaxFileBytes         int64
+	WatcherDebounce      time.Duration
+	WatcherQueueCapacity int
+	Readonly             bool
+	Interactive          bool // when true, log every file event to stderr
 	// ApprovedInitialMountMerge is set by the mount preflight after it has
 	// shown the local/remote plan and confirmed the safe union with the user.
 	ApprovedInitialMountMerge bool
@@ -75,6 +76,9 @@ type syncDaemon struct {
 // newSyncDaemon initializes (but does not start) a daemon for the given
 // workspace + local path. Run() does the heavy lifting.
 func newSyncDaemon(cfg syncDaemonConfig) (*syncDaemon, error) {
+	if err := validateSyncWatcherQueueCapacity(cfg.WatcherQueueCapacity); err != nil {
+		return nil, err
+	}
 	if cfg.FS == nil {
 		return nil, errors.New("syncDaemon: nil client")
 	}
@@ -136,6 +140,7 @@ func newSyncDaemon(cfg syncDaemonConfig) (*syncDaemon, error) {
 	if cfg.Rdb != nil && strings.TrimSpace(cfg.StorageID) != "" && strings.TrimSpace(cfg.SessionID) != "" {
 		d.uploader.mountChangelog(cfg.Rdb, cfg.StorageID, cfg.SessionID, cfg.User, cfg.AgentID, cfg.Label, cfg.AgentVersion)
 	}
+	d.reconciler.recordChange = d.uploader.emitChange
 	d.downloader = newDownloader(cfg.FS, d.reconciler.downloadOut(), cfg.LocalRoot, conflict, echo, cfg.Readonly, log)
 	d.pump = newRemoteSubscriptionPump(cfg.FS, log, stateWriter)
 	return d, nil
@@ -200,7 +205,7 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 	// the target directory — that would invalidate any fsnotify watches
 	// installed earlier. Installing after guarantees the watches land on
 	// the final directory tree.
-	w, err := newSyncWatcher(d.cfg.LocalRoot, d.ignore, d.cfg.WatcherDebounce)
+	w, err := newSyncWatcher(d.cfg.LocalRoot, d.ignore, d.cfg.WatcherDebounce, d.cfg.WatcherQueueCapacity)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("watcher: %w", err)
@@ -268,12 +273,37 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 			select {
 			case <-dctx.Done():
 				return
+			case <-w.Rescans():
+				if dctx.Err() != nil {
+					return
+				}
+				if err := d.recoverWatcherOverflow(workCtx); err != nil {
+					if dctx.Err() != nil {
+						return
+					}
+					fmt.Fprintf(os.Stderr, "afs sync: watcher recovery failed, retrying: %v\n", err)
+					// Keep recovery pending through transient failures without
+					// spinning on an unavailable filesystem or Redis server.
+					timer := time.NewTimer(time.Second)
+					select {
+					case <-dctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+						w.requestRescan()
+					}
+				}
 			case <-d.reconciler.fullSweepRequests():
 				if dctx.Err() != nil {
 					return
 				}
-				if err := d.full.run(workCtx, nil); err != nil && !errors.Is(err, context.Canceled) {
+				// Startup has already completed. A deferred recovery can leave
+				// only hidden local entries, which still must be merged safely.
+				if err := d.full.warmStart(workCtx, nil); err != nil && !errors.Is(err, context.Canceled) {
 					fmt.Fprintf(os.Stderr, "afs sync: full reconcile failed: %v\n", err)
+					// Preserve the retry guarantee when an overflow scan deferred
+					// an upload and its result woke this ordinary sweep channel.
+					w.requestRescan()
 				}
 			case <-d.reconciler.rootReplaceRequests():
 				if dctx.Err() != nil {
@@ -310,6 +340,15 @@ func (d *syncDaemon) start(ctx context.Context, onProgress ProgressFunc, skipRec
 	}()
 
 	return nil
+}
+
+func (d *syncDaemon) recoverWatcherOverflow(ctx context.Context) error {
+	if err := d.watcher.resetRecursive(d.cfg.LocalRoot); err != nil {
+		return fmt.Errorf("refresh watches: %w", err)
+	}
+	// This is an existing working directory. Cold-start hydration may
+	// replace a tree containing only hidden entries such as .venv.
+	return d.full.warmStart(ctx, nil)
 }
 
 func (d *syncDaemon) startQueryIndexWorker(ctx context.Context) {

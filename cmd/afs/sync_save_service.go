@@ -182,6 +182,12 @@ func (s *syncSaveService) save(request syncControlRequest) syncControlResult {
 			saveErr = errors.Join(saveErr, fmt.Errorf("could not resume sync: %w", err))
 		} else {
 			s.active = fresh
+			if saveErr != nil {
+				// Shutdown discarded watcher timers and queued operations. Recover
+				// from the retained baseline and actual tree, with ordinary conflict
+				// handling and retries, even when no new watcher event arrives.
+				fresh.watcher.requestRescan()
+			}
 		}
 	}
 	if saveErr != nil {

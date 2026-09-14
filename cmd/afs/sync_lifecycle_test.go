@@ -18,6 +18,7 @@ func TestLoadSyncDaemonBootstrapFromEnv(t *testing.T) {
 			ProductMode:      productModeSelfHosted,
 			CurrentWorkspace: "repo",
 			LocalPath:        filepath.Join(homeDir, "repo"),
+			syncSettings:     syncSettings{SyncWatcherQueueCapacity: 8192},
 			redisConfig: redisConfig{
 				RedisAddr: "127.0.0.1:6379",
 				RedisDB:   2,
@@ -53,6 +54,9 @@ func TestLoadSyncDaemonBootstrapFromEnv(t *testing.T) {
 	}
 	if loaded.Config.RedisAddr != "127.0.0.1:6379" {
 		t.Fatalf("loaded redis addr = %q, want %q", loaded.Config.RedisAddr, "127.0.0.1:6379")
+	}
+	if got := syncWatcherQueueCapacity(loaded.Config); got != 8192 {
+		t.Fatalf("loaded watcher queue capacity = %d, want 8192", got)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected bootstrap file to be removed after load, stat err = %v", err)

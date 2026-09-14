@@ -1038,7 +1038,8 @@ func TestSyncHistoryRenamePreservesLineage(t *testing.T) {
 			return false
 		}
 		versions := newHistory.Lineages[0].Versions
-		return versions[len(versions)-1].Op == controlplane.ChangeOpPut
+		latest := versions[len(versions)-1]
+		return latest.Op == controlplane.ChangeOpPut && latest.ContentHash == sha256Hex([]byte("rename me\nand update me\n"))
 	})
 	if newHistory.Lineages[0].FileID != oldHistory.Lineages[0].FileID {
 		t.Fatalf("renamed file_id = %q, want %q", newHistory.Lineages[0].FileID, oldHistory.Lineages[0].FileID)

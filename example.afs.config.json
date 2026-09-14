@@ -26,6 +26,7 @@
     }
   },
   "sync": {
-    "fileSizeCapMB": 2048
+    "fileSizeCapMB": 2048,
+    "watcherQueueCapacity": 1024
   }
 }

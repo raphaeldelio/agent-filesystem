@@ -38,8 +38,36 @@ debugging configuration.
 Use sync mode when humans, editors, language servers, tests, or shell tools need
 a normal directory on disk.
 
-Sync mode uploads local changes asynchronously. Before ending a session that
-must preserve its changes, stop all application writes and all other writers
+Sync mode uploads local changes asynchronously. If the watcher output queue
+fills or the operating system reports an event overflow, AFS requests recovery
+through a separate notification channel. Recovery refreshes directory watches
+and reconciles the existing local tree with Redis. Repeated overflow requests
+coalesce, and a request received during a scan schedules another pass. Failed
+recovery attempts are logged and retried after a one second delay.
+
+While applying changes beneath read-only local directories, reconciliation
+temporarily grants owner access and restores their permissions after the
+changes finish. Permissions are also restored when a pass fails or is cancelled,
+so a later retry can resume an incomplete directory download.
+
+Set the event buffer with `afs config set sync.watcherQueueCapacity 8192`.
+The default is 1024 events per sync daemon. Values from 1 through 1048576 are
+accepted; 0 or `afs config unset sync.watcherQueueCapacity` restores the default.
+The setting takes effect when the sync daemon next starts. It does not change
+the operating system's watcher limits.
+
+A larger event buffer consumes more memory and can absorb longer bursts, but
+does not increase synchronization throughput. The recovery channel holds one
+pending scan signal regardless of event buffer capacity. Recovery scans the
+workspace and performs Redis operations, adding CPU, disk, and network work.
+Continued overflow can require further scans and delay synchronization.
+
+Recovery follows the existing reconciliation and conflict rules. A successful
+local write does not wait for remote upload, so changes can still be lost if the
+local environment disappears before synchronization completes.
+
+Before ending a session that must preserve its changes, stop all application
+writes and all other writers
 to the remote volume, then run:
 
 ```bash
@@ -52,7 +80,14 @@ included tree's actual file bytes, types, permissions and symlink targets were
 verified against Redis. The JSON result includes the volume, local root, entry
 and file counts, byte count, tree SHA256 and completion time. Save attempts to
 resume normal synchronization after the operation. If resuming fails, save
-returns an error and the mount must be restarted.
+returns an error and the mount must be restarted. After a failed save, the
+resumed daemon scans the local tree and retries pending work using the normal
+conflict rules, even if no further watcher event arrives.
+
+Save mutations use the same session History and file-version recording as
+background uploads when the mount has session attribution. Unchanged entries
+and chunk metadata repairs do not add History rows. Changes that finish before
+a later save failure remain in History; retrying does not repeat those rows.
 
 Conflicting local and remote changes, an unstable tree, failed operations, and
 timeout return failure. Some changes may already have reached Redis on failure;

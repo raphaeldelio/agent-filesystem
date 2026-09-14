@@ -253,7 +253,14 @@ Save discovers the included local tree even when watcher notifications were
 missed, then verifies actual file bytes, types, permissions and symlink targets
 in Redis. The mount's ignore rules apply. Save attempts to resume normal sync
 after the operation. If resuming fails, save returns an error and the mount
-must be restarted. Save does not create a checkpoint.
+must be restarted. A resumed daemon recovers pending work after failed saves
+by scanning the current local tree with the normal conflict rules. Save does
+not create a checkpoint.
+
+When session attribution is available, save records its mutations in session
+History and file versions through the same path as background uploads. This
+includes mutations completed before a later failure. Unchanged entries and
+chunk metadata repairs do not add History rows.
 
 | Option | Meaning |
 | --- | --- |
@@ -308,6 +315,7 @@ Common keys:
 | `redis.url` | Standalone Redis URL. |
 | `agent.name` | Human-friendly agent name for attribution. |
 | `sync.fileSizeCapMB` | Maximum file size synced by the mount daemon. |
+| `sync.watcherQueueCapacity` | Buffered local watcher events per sync daemon. Default: 1024. Accepts integers from 1 through 1048576; 0 resets to the default. Applies when the daemon next starts. |
 
 Examples:
 
@@ -319,6 +327,7 @@ afs config set mode mount
 afs config set controlPlane.url http://127.0.0.1:8091
 afs config set agent.name "Claude Code"
 afs config set sync.fileSizeCapMB 4096
+afs config set sync.watcherQueueCapacity 8192
 afs config unset controlPlane.database
 afs config reset
 afs config list

@@ -349,20 +349,21 @@ func startSyncMount(ctx context.Context, cfg config, selection workspaceSelectio
 	store := newAFSStore(rdb)
 	fsClient := client.New(rdb, bootstrap.redisKey)
 	daemon, err := newSyncDaemon(syncDaemonConfig{
-		Workspace:        bootstrap.workspace,
-		LocalRoot:        localRoot,
-		FS:               fsClient,
-		Store:            store,
-		MaxFileBytes:     syncSizeCapBytes(runtimeCfg),
-		Readonly:         runtimeCfg.ReadOnly,
-		Rdb:              rdb,
-		QueryIndexFSKey:  bootstrap.redisKey,
-		StorageID:        bootstrap.redisKey,
-		HeadCheckpointID: bootstrap.headCheckpoint,
-		SessionID:        bootstrap.sessionID,
-		AgentID:          runtimeCfg.ID,
-		Label:            runtimeCfg.Name,
-		AgentVersion:     version.String(),
+		Workspace:            bootstrap.workspace,
+		LocalRoot:            localRoot,
+		FS:                   fsClient,
+		Store:                store,
+		MaxFileBytes:         syncSizeCapBytes(runtimeCfg),
+		WatcherQueueCapacity: syncWatcherQueueCapacity(runtimeCfg),
+		Readonly:             runtimeCfg.ReadOnly,
+		Rdb:                  rdb,
+		QueryIndexFSKey:      bootstrap.redisKey,
+		StorageID:            bootstrap.redisKey,
+		HeadCheckpointID:     bootstrap.headCheckpoint,
+		SessionID:            bootstrap.sessionID,
+		AgentID:              runtimeCfg.ID,
+		Label:                runtimeCfg.Name,
+		AgentVersion:         version.String(),
 	})
 	if err != nil {
 		closeManagedWorkspaceSession(runtimeCfg, bootstrap.workspace, bootstrap.sessionID)

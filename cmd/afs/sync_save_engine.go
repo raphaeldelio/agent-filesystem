@@ -79,40 +79,13 @@ func saveSyncTree(ctx context.Context, r *reconciler, local syncSaveTree) (syncS
 		return receipt, fmt.Errorf("local tree changed during save: %w", err)
 	}
 	for _, rel := range remove {
-		if err := ctx.Err(); err != nil {
-			return receipt, err
-		}
-		if err := r.fs.Rm(ctx, absoluteRemotePath(rel)); err != nil {
+		if err := removeSyncSaveEntry(ctx, r, rel, remote[rel]); err != nil {
 			return receipt, fmt.Errorf("save remove %s: %w", rel, err)
 		}
+		delete(remote, rel)
 	}
 	for _, rel := range write {
-		if err := ctx.Err(); err != nil {
-			return receipt, err
-		}
-		entry := local[rel]
-		remotePath := absoluteRemotePath(rel)
-		switch entry.Type {
-		case "dir":
-			if previous, ok := remote[rel]; !ok || previous.Type != "dir" {
-				if err := r.fs.Mkdir(ctx, remotePath); err != nil {
-					return receipt, fmt.Errorf("save mkdir %s: %w", rel, err)
-				}
-			}
-			err = r.fs.Chmod(ctx, remotePath, entry.Mode)
-		case "symlink":
-			err = r.fs.Ln(ctx, entry.Target, remotePath)
-			if err == nil && entry.Mode != 0o777 {
-				err = r.fs.Chmod(ctx, remotePath, entry.Mode)
-			}
-		case "file":
-			var data []byte
-			data, err = readSyncSaveFile(ctx, filepath.Join(r.root, filepath.FromSlash(rel)), entry, r.maxFileBytes)
-			if err == nil {
-				err = r.fs.EchoCreate(ctx, remotePath, data, entry.Mode)
-			}
-		}
-		if err != nil {
+		if err := writeSyncSaveEntry(ctx, r, rel, local[rel], remote[rel]); err != nil {
 			return receipt, fmt.Errorf("save %s: %w", rel, err)
 		}
 	}

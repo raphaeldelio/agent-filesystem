@@ -110,8 +110,10 @@ func persistedConfigFromRuntime(cfg config) persistedConfig {
 			Account:    strings.TrimSpace(cfg.Account),
 		}
 	}
-	if cfg.SyncFileSizeCapMB > 0 && cfg.SyncFileSizeCapMB != defaultSyncFileSizeCapMB {
-		out.Sync = &syncSettings{SyncFileSizeCapMB: cfg.SyncFileSizeCapMB}
+	if (cfg.SyncFileSizeCapMB > 0 && cfg.SyncFileSizeCapMB != defaultSyncFileSizeCapMB) ||
+		(cfg.SyncWatcherQueueCapacity > 0 && cfg.SyncWatcherQueueCapacity != defaultSyncWatcherQueueCapacity) {
+		settings := cfg.syncSettings
+		out.Sync = &settings
 	}
 	out.Runtime = &persistedRuntime{
 		Mount: persistedMountSettings(cfg.mountSettings),
@@ -157,7 +159,7 @@ func loadConfig() (config, error) {
 	cfg.Mode = raw.Mode
 	if raw.Sync != nil {
 		cfg.syncSettings = *raw.Sync
-	} else if legacy.SyncFileSizeCapMB != 0 {
+	} else if legacy.SyncFileSizeCapMB != 0 || legacy.SyncWatcherQueueCapacity != 0 {
 		cfg.syncSettings = legacy.syncSettings
 	}
 	cfg.CurrentWorkspace = strings.TrimSpace(raw.Workspace.DefaultWorkspace)
@@ -195,7 +197,8 @@ func defaultConfig() config {
 			SyncLog:  "/tmp/afs-sync.log",
 		},
 		syncSettings: syncSettings{
-			SyncFileSizeCapMB: defaultSyncFileSizeCapMB,
+			SyncFileSizeCapMB:        defaultSyncFileSizeCapMB,
+			SyncWatcherQueueCapacity: defaultSyncWatcherQueueCapacity,
 		},
 		WorkRoot: defaultWorkRoot(),
 	}
@@ -337,6 +340,9 @@ func prepareConfigForSave(cfg *config) error {
 
 	if cfg.SyncFileSizeCapMB < 0 {
 		return fmt.Errorf("sync.fileSizeCapMB must be >= 0")
+	}
+	if err := validateSyncWatcherQueueCapacity(cfg.SyncWatcherQueueCapacity); err != nil {
+		return err
 	}
 
 	if productMode == productModeLocal {

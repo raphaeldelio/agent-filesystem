@@ -153,6 +153,7 @@ func TestSyncSaveChunkDownloadStagesDeltaAndHonorsCancellation(t *testing.T) {
 			downloader := newDownloader(remote, results, root, newConflictNamer(), newEchoSuppressor(), false, newSyncLogger(false))
 			downloader.process(ctx, downloadOp{Kind: opDownloadFile, Path: "file", AbsPath: path,
 				Chunked: true, ChunkSize: 4, FileSize: 8, DirtyChunks: []int{1},
+				HasStored: true, StoredEntry: SyncEntry{Type: "file", Size: 8, Mode: 0o640, ChunkSize: 4, LocalHash: compositeHash([]string{sha256Hex([]byte("abcd")), sha256Hex([]byte("efgh"))})},
 				ChunkHashes: []string{sha256Hex([]byte("abcd")), sha256Hex([]byte("EDIT"))}})
 			result := <-results
 			want := "abcdEDIT"
@@ -221,9 +222,15 @@ func TestSyncSaveInboundSymlinkReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			stored := SyncEntry{Type: kind, Size: 3, Mode: 0o644, LocalHash: sha256Hex([]byte("old"))}
+			if kind == "symlink" {
+				stored.Target = "old"
+			} else if kind == "directory" {
+				stored.Type, stored.Mode = "dir", 0o755
+			}
 			results := make(chan downloadResult, 1)
 			downloader := newDownloader(nil, results, root, newConflictNamer(), newEchoSuppressor(), false, newSyncLogger(false))
-			downloader.process(context.Background(), downloadOp{Kind: opDownloadSymlink, Path: "local", AbsPath: path, Symlink: "new"})
+			downloader.process(context.Background(), downloadOp{Kind: opDownloadSymlink, Path: "local", AbsPath: path, Symlink: "new", HasStored: true, StoredEntry: stored})
 			if result := <-results; result.Err != nil {
 				t.Fatal(result.Err)
 			}
@@ -232,6 +239,34 @@ func TestSyncSaveInboundSymlinkReplacement(t *testing.T) {
 			}
 			if entries, err := os.ReadDir(root); err != nil || len(entries) != 1 {
 				t.Fatalf("temporary symlink remains: %v, %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestSyncSaveStagedDownloadPreservesConcurrentLocalEdit(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprint(conflict), func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "local")
+			if err := os.WriteFile(path, []byte("baseline"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			d := newDownloader(nil, nil, root, newConflictNamer(), newEchoSuppressor(), false, newSyncLogger(false))
+			moved, err := d.writeLocalFile(context.Background(), downloadOp{Path: "local", AbsPath: path, Conflict: conflict}, 0o644, func(file *os.File) error {
+				if _, err := file.Write([]byte("remote")); err != nil {
+					return err
+				}
+				return os.WriteFile(path, []byte("concurrent local edit"), 0o640)
+			})
+			if !errors.Is(err, errSyncDownloadLocalChanged) || moved != "" {
+				t.Fatalf("staged write = %q, %v", moved, err)
+			}
+			if data, err := os.ReadFile(path); err != nil || string(data) != "concurrent local edit" {
+				t.Fatalf("local edit lost: %q, %v", data, err)
+			}
+			if entries, err := os.ReadDir(root); err != nil || len(entries) != 1 {
+				t.Fatalf("staging/conflict file left behind: %v, %v", entries, err)
 			}
 		})
 	}

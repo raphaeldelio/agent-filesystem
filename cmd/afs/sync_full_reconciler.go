@@ -57,20 +57,24 @@ type observedMeta struct {
 	mode    uint32
 	size    int64
 	mtimeMs int64
+	mtimeNs int64  // local observation, used to reject changes during a scan
 	target  string // symlink target (local) or readlink result (remote)
 }
 
 // syncAction is one entry in the plan the reconciler builds during the diff
 // phase, then executes in parallel during the apply phase.
 type syncAction struct {
-	kind       string // "download" | "upload" | "mkdir-local" | "mkdir-remote" | "delete-local" | "delete-remote" | "symlink-download" | "symlink-upload"
-	path       string // workspace-relative POSIX, no leading slash
-	absPath    string // absolute local path
-	mode       uint32
-	target     string // for symlinks
-	conflict   bool
-	localMeta  *observedMeta
-	remoteMeta *observedMeta // carried from scan phase so exec can record mtime in state
+	kind        string // "download" | "upload" | "mkdir-local" | "mkdir-remote" | "delete-local" | "delete-remote" | "symlink-download" | "symlink-upload"
+	path        string // workspace-relative POSIX, no leading slash
+	absPath     string // absolute local path
+	mode        uint32
+	target      string // for symlinks
+	conflict    bool
+	localMeta   *observedMeta
+	remoteMeta  *observedMeta // carried from scan phase so exec can record mtime in state
+	checkState  bool
+	storedEntry SyncEntry
+	hasStored   bool
 }
 
 const defaultParallelWorkers = 8
@@ -418,6 +422,11 @@ func (f *fullReconciler) detectOfflineDeletes(local map[string]observedMeta) {
 			continue
 		}
 		if _, exists := local[path]; !exists {
+			// A background download or application may have created the path
+			// after the local walk passed its parent.
+			if _, err := os.Lstat(filepath.Join(f.r.root, filepath.FromSlash(path))); !os.IsNotExist(err) {
+				continue
+			}
 			f.r.log.Info(fmt.Sprintf("detectOfflineDeletes %s: in state but missing locally -> tombstone", path))
 			entry.Deleted = true
 			entry.Version = f.r.state.nextVersion()
@@ -478,6 +487,7 @@ func (f *fullReconciler) scanLocalMeta() (map[string]observedMeta, error) {
 			mode:    uint32(info.Mode() & fs.ModePerm),
 			size:    info.Size(),
 			mtimeMs: info.ModTime().UnixMilli(),
+			mtimeNs: info.ModTime().UnixNano(),
 		}
 		return nil
 	})
@@ -547,6 +557,7 @@ func (f *fullReconciler) scanRemoteDirMeta(ctx context.Context, dir string, out 
 // buildPlan diffs local vs remote vs persisted state and produces a list of
 // actions. The ctx is used for remote Stat calls in the lok && !rok case.
 func (f *fullReconciler) buildPlan(ctx context.Context, local, remote map[string]observedMeta) []syncAction {
+	baseline := f.r.state.snapshot().Entries
 	all := make(map[string]struct{}, len(local)+len(remote))
 	for k := range local {
 		all[k] = struct{}{}
@@ -559,12 +570,13 @@ func (f *fullReconciler) buildPlan(ctx context.Context, local, remote map[string
 	// parallel phase (the worker pool creates parents before writing children).
 	var plan []syncAction
 	for path := range all {
+		if f.r.deferScanForPendingUpload(path) {
+			continue
+		}
 		l, lok := local[path]
 		r, rok := remote[path]
 
-		f.r.state.mu.Lock()
-		stored, hasStored := f.r.state.state.Entries[path]
-		f.r.state.mu.Unlock()
+		stored, hasStored := baseline[path]
 
 		abs := filepath.Join(f.r.root, filepath.FromSlash(path))
 
@@ -579,6 +591,10 @@ func (f *fullReconciler) buildPlan(ctx context.Context, local, remote map[string
 				if statErr == nil && stat != nil {
 					f.r.log.Info(fmt.Sprintf("buildPlan %s: lok && !rok, hasStored, Stat found -> skip scan race", path))
 					continue // Remote still has it — scan race, skip
+				}
+				if statErr != nil && !isClientNotFound(statErr) {
+					f.r.requestFullSweep()
+					continue
 				}
 				f.r.log.Info(fmt.Sprintf("buildPlan %s: lok && !rok, hasStored, Stat nil (err=%v) -> delete-local", path, statErr))
 				plan = append(plan, syncAction{kind: "delete-local", path: path, absPath: abs})
@@ -614,12 +630,12 @@ func (f *fullReconciler) buildPlan(ctx context.Context, local, remote map[string
 			// Both present. Check if they match using metadata (size+mtime
 			// for files, target for symlinks). Only go deeper if they differ.
 			if metaMatch(l, r, stored, hasStored) {
-				f.refreshStateMeta(path, l, r)
+				f.refreshStateMeta(path, l, r, stored, hasStored)
 				continue
 			}
 			if hasStored && !stored.Deleted {
-				localChanged := observedChangedFromStored(l, stored, true)
-				remoteChanged := observedChangedFromStored(r, stored, false)
+				localChanged := observedChangedFromStored(l, stored, true) || l.mode != stored.Mode
+				remoteChanged := observedChangedFromStored(r, stored, false) || r.mode != stored.Mode
 				switch {
 				case localChanged && !remoteChanged:
 					plan = append(plan, f.planUpload(path, abs, l, stored, hasStored)...)
@@ -628,11 +644,22 @@ func (f *fullReconciler) buildPlan(ctx context.Context, local, remote map[string
 				case localChanged && remoteChanged:
 					plan = append(plan, f.planDownload(path, abs, r, stored, hasStored, true))
 				default:
-					f.refreshStateMeta(path, l, r)
+					f.refreshStateMeta(path, l, r, stored, hasStored)
 				}
 				continue
 			}
 			plan = append(plan, f.planDownload(path, abs, r, stored, hasStored, true))
+		}
+	}
+	for i := range plan {
+		a := &plan[i]
+		a.checkState = true
+		a.storedEntry, a.hasStored = baseline[a.path]
+		if l, exists := local[a.path]; exists {
+			a.localMeta = &l
+		}
+		if r, exists := remote[a.path]; exists {
+			a.remoteMeta = &r
 		}
 	}
 	return plan
@@ -672,11 +699,11 @@ func metaMatch(l, r observedMeta, stored SyncEntry, hasStored bool) bool {
 	}
 	switch l.kind {
 	case "dir":
-		return true
+		return l.mode == r.mode
 	case "symlink":
 		return l.target == r.target
 	case "file":
-		if l.size != r.size {
+		if l.size != r.size || l.mode != r.mode {
 			return false
 		}
 		// If we have stored state and both sides match it, they're in sync.
@@ -698,7 +725,11 @@ func metaMatch(l, r observedMeta, stored SyncEntry, hasStored bool) bool {
 }
 
 // executePlan runs the planned actions with a bounded worker pool.
-func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onProgress ProgressFunc) error {
+func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onProgress ProgressFunc) (result error) {
+	directoryModes := newSyncDirectoryModes(f.r)
+	defer func() {
+		result = errors.Join(result, directoryModes.restore())
+	}()
 	// Separate actions whose ordering matters from the parallel file ops.
 	// Dirs must happen first so parent directories exist before child writes.
 	// Deletes run deepest-path-first so non-empty remote directories are
@@ -714,6 +745,14 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 			fileActions = append(fileActions, a)
 		}
 	}
+	sort.SliceStable(dirActions, func(i, j int) bool {
+		leftDepth := strings.Count(dirActions[i].path, "/")
+		rightDepth := strings.Count(dirActions[j].path, "/")
+		if leftDepth != rightDepth {
+			return leftDepth < rightDepth
+		}
+		return dirActions[i].path < dirActions[j].path
+	})
 	sort.SliceStable(deleteActions, func(i, j int) bool {
 		leftDepth := strings.Count(deleteActions[i].path, "/")
 		rightDepth := strings.Count(deleteActions[j].path, "/")
@@ -737,11 +776,36 @@ func (f *fullReconciler) executePlan(ctx context.Context, plan []syncAction, onP
 		if err := f.checkRunning(ctx); err != nil {
 			return err
 		}
+		if a.kind == "mkdir-local" {
+			if err := directoryModes.prepare(filepath.Dir(a.absPath)); err != nil {
+				return err
+			}
+		}
 		if err := f.executeAction(ctx, a); err != nil {
 			return err
 		}
+		if a.kind == "mkdir-local" {
+			if err := directoryModes.prepare(a.absPath); err != nil {
+				return err
+			}
+		}
 		done.Add(1)
 		report()
+	}
+
+	// Existing directories may already have their final restrictive modes
+	// and therefore have no mkdir action. Reopen parents before local writes
+	// or deletes; restore only after all parallel workers have joined.
+	for _, a := range plan {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		switch a.kind {
+		case "download", "symlink-download", "delete-local":
+			if err := directoryModes.prepare(filepath.Dir(a.absPath)); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Phase 2: ordered deletes (serial, dependency-sensitive).
@@ -809,6 +873,9 @@ func (f *fullReconciler) executeAction(ctx context.Context, a syncAction) error 
 	if err := f.checkRunning(ctx); err != nil {
 		return err
 	}
+	if !f.actionStillCurrent(a) {
+		return nil
+	}
 	switch a.kind {
 	case "mkdir-local":
 		return f.execMkdirLocal(a)
@@ -835,8 +902,13 @@ func (f *fullReconciler) execMkdirLocal(a syncAction) error {
 	if err := os.MkdirAll(a.absPath, 0o755); err != nil {
 		return err
 	}
+	if a.mode != 0 {
+		if err := os.Chmod(a.absPath, fs.FileMode(a.mode)); err != nil {
+			return err
+		}
+	}
 	f.r.echo.markDir(a.path)
-	f.updateState(a.path, SyncEntry{
+	f.updateActionState(a, SyncEntry{
 		Type:         "dir",
 		Mode:         a.mode,
 		LastSyncedAt: time.Now().UTC(),
@@ -849,7 +921,12 @@ func (f *fullReconciler) execMkdirRemote(ctx context.Context, a syncAction) erro
 	if err := f.r.fs.Mkdir(ctx, remotePath); err != nil && !isClientAlreadyExists(err) {
 		return fmt.Errorf("mkdir remote %s: %w", a.path, err)
 	}
-	f.updateState(a.path, SyncEntry{
+	if a.mode != 0 {
+		if err := f.r.fs.Chmod(ctx, remotePath, a.mode); err != nil {
+			return fmt.Errorf("chmod remote directory %s: %w", a.path, err)
+		}
+	}
+	f.updateActionState(a, SyncEntry{
 		Type:         "dir",
 		Mode:         a.mode,
 		LastSyncedAt: time.Now().UTC(),
@@ -886,9 +963,16 @@ func (f *fullReconciler) execDownload(ctx context.Context, a syncAction) error {
 		return err
 	}
 
-	if a.conflict {
+	if !f.actionStillCurrent(a) {
+		return nil
+	}
+	localData, localErr := os.ReadFile(a.absPath)
+	localInfo, statErr := os.Lstat(a.absPath)
+	identical := localErr == nil && statErr == nil && localInfo.Mode().IsRegular() &&
+		sha256Hex(localData) == hash && uint32(localInfo.Mode().Perm()) == a.mode
+	if a.conflict && !identical {
 		if _, err := moveLocalToConflict(f.r.conflict, a.absPath); err != nil {
-			fmt.Fprintf(os.Stderr, "afs sync: conflict copy %s: %v\n", a.path, err)
+			return fmt.Errorf("conflict copy %s: %w", a.path, err)
 		}
 	}
 
@@ -899,10 +983,12 @@ func (f *fullReconciler) execDownload(ctx context.Context, a syncAction) error {
 	if f.r.readonly {
 		mode = 0o444
 	}
-	if err := atomicWriteFileStandalone(a.absPath, data, mode, os.Getpid()); err != nil {
-		return fmt.Errorf("write %s: %w", a.path, err)
+	if !identical || f.r.readonly {
+		if err := atomicWriteFileStandalone(a.absPath, data, mode, os.Getpid()); err != nil {
+			return fmt.Errorf("write %s: %w", a.path, err)
+		}
+		f.r.echo.markFile(a.path, hash)
 	}
-	f.r.echo.markFile(a.path, hash)
 
 	// Record both mtimes so the next startup's metaMatch can skip unchanged
 	// files without re-reading content. Local mtime comes from the file we
@@ -914,7 +1000,7 @@ func (f *fullReconciler) execDownload(ctx context.Context, a syncAction) error {
 	if a.remoteMeta != nil {
 		remoteMtimeMs = a.remoteMeta.mtimeMs
 	}
-	f.updateState(a.path, SyncEntry{
+	f.updateActionState(a, SyncEntry{
 		Type:          "file",
 		Mode:          mode,
 		Size:          int64(len(data)),
@@ -968,7 +1054,7 @@ func (f *fullReconciler) execDeleteLocal(ctx context.Context, a syncAction) erro
 func (f *fullReconciler) execDeleteRemote(ctx context.Context, a syncAction) error {
 	f.r.log.Info(fmt.Sprintf("execDeleteRemote %s", a.path))
 	remotePath := absoluteRemotePath(a.path)
-	if err := f.r.fs.Rm(ctx, remotePath); err != nil && !isClientNotFound(err) {
+	if err := f.r.fs.Rm(ctx, remotePath); err != nil && !isClientNotFound(err) && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("rm remote %s: %w", a.path, err)
 	}
 	f.r.state.mu.Lock()
@@ -992,6 +1078,13 @@ func (f *fullReconciler) execUpload(ctx context.Context, a syncAction) error {
 		fmt.Fprintf(os.Stderr, "afs sync: skipping upload of %s — mount is read-only\n", a.path)
 		return nil
 	}
+	localInfo, err := os.Lstat(a.absPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	data, err := os.ReadFile(a.absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1004,6 +1097,12 @@ func (f *fullReconciler) execUpload(ctx context.Context, a syncAction) error {
 		return nil
 	}
 	hash := sha256Hex(data)
+	if !f.actionStillCurrent(a) {
+		return nil
+	}
+	if current, err := f.remoteStillCurrent(ctx, a); err != nil || !current {
+		return err
+	}
 	remotePath := absoluteRemotePath(a.path)
 	if err := f.checkRunning(ctx); err != nil {
 		return err
@@ -1016,19 +1115,22 @@ func (f *fullReconciler) execUpload(ctx context.Context, a syncAction) error {
 		mode = 0o644
 	}
 	_ = f.r.fs.Chmod(ctx, remotePath, mode)
-
-	var localMtimeMs int64
-	if fi, err := os.Stat(a.absPath); err == nil {
-		localMtimeMs = fi.ModTime().UnixMilli()
+	remoteStat, err := f.r.fs.Stat(ctx, remotePath)
+	if err != nil {
+		return fmt.Errorf("stat uploaded %s: %w", a.path, err)
 	}
-	f.updateState(a.path, SyncEntry{
+	if remoteStat == nil {
+		return fmt.Errorf("uploaded file %s is missing remotely", a.path)
+	}
+
+	f.updateActionState(a, SyncEntry{
 		Type:          "file",
 		Mode:          mode,
 		Size:          int64(len(data)),
 		LocalHash:     hash,
 		RemoteHash:    hash,
-		LocalMtimeMs:  localMtimeMs,
-		RemoteMtimeMs: localMtimeMs, // best estimate without a Stat RPC; close enough for skip logic
+		LocalMtimeMs:  localInfo.ModTime().UnixMilli(),
+		RemoteMtimeMs: remoteStat.Mtime,
 		LastSyncedAt:  time.Now().UTC(),
 	})
 	return nil
@@ -1108,20 +1210,25 @@ func (f *fullReconciler) updateState(path string, entry SyncEntry) {
 	f.r.state.mu.Unlock()
 }
 
-func (f *fullReconciler) refreshStateMeta(rel string, l, r observedMeta) {
+func (f *fullReconciler) refreshStateMeta(rel string, l, r observedMeta, stored SyncEntry, hasStored bool) {
 	now := time.Now().UTC()
 	f.r.state.mu.Lock()
 	defer f.r.state.mu.Unlock()
-	f.r.state.state.Entries[rel] = SyncEntry{
-		Type:          l.kind,
-		Mode:          l.mode,
-		Size:          l.size,
-		LocalMtimeMs:  l.mtimeMs,
-		RemoteMtimeMs: r.mtimeMs,
-		Target:        targetFromMeta(l, r),
-		LastSyncedAt:  now,
-		Version:       f.r.state.nextVersion(),
+	entry, exists := f.r.state.state.Entries[rel]
+	if exists != hasStored || exists && entry.Version != stored.Version {
+		f.r.requestFullSweep()
+		return
 	}
+	entry.Deleted = false
+	entry.Type = l.kind
+	entry.Mode = l.mode
+	entry.Size = l.size
+	entry.LocalMtimeMs = l.mtimeMs
+	entry.RemoteMtimeMs = r.mtimeMs
+	entry.Target = targetFromMeta(l, r)
+	entry.LastSyncedAt = now
+	entry.Version = f.r.state.nextVersion()
+	f.r.state.state.Entries[rel] = entry
 	f.r.state.dirty = true
 }
 
